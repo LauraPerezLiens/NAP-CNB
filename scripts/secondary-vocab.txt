@@ -1,0 +1,8 @@
+[PAD]
+[UNK]
+[CLS]
+[MASK]
+[SEP]
+c
+e
+h
