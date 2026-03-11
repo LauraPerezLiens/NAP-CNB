@@ -14,7 +14,11 @@ The project integrates sequence processing, epitope classification, secondary st
 ## Repository structure
 NAP-CNB
 ├── scripts/ → Python scripts for data processing and model pipelines
+
 ├── slurms/ → SLURM job scripts for cluster execution
+
 ├── data/ → datasets (ignored by git)
+
 ├── models/ → trained models (ignored by git)
+
 ├── miniconda3/ → local conda environments (ignored by git)
