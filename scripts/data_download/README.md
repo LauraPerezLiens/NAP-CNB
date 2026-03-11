@@ -80,6 +80,6 @@ These files contain:
 
 This script represents **Step 1 of the pipeline**:
 
-1️⃣ Download epitope data from IEDB  
-2️⃣ Generate curated epitope tables  
-3️⃣ Provide input data for downstream feature extraction and model training
+1. Download epitope data from IEDB  
+2. Generate curated epitope tables  
+3. Provide input data for downstream feature extraction and model training
