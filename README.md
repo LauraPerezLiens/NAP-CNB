@@ -13,6 +13,7 @@ The project integrates sequence processing, epitope classification, secondary st
 
 ## Repository structure
 NAP-CNB
+
 ├── scripts/ → Python scripts for data processing and model pipelines
 
 ├── slurms/ → SLURM job scripts for cluster execution
