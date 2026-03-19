@@ -4,6 +4,8 @@
 import csv
 import logging
 import re
+import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -28,9 +30,37 @@ SPECIES_QUERY = {
     "human": "Homo sapiens",
 }
 
-
-# Regex: primer bloque de aminoácidos (A-Z). Si hay modificaciones tipo "+ MCM(K4)" se ignora.
 AA_BLOCK_RE = re.compile(r"([A-Z]+)")
+
+
+class MaxLevelFilter(logging.Filter):
+    def __init__(self, max_level: int) -> None:
+        super().__init__()
+        self.max_level = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno <= self.max_level
+
+
+def setup_logging() -> None:
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
+    stdout_handler.addFilter(MaxLevelFilter(logging.INFO))
+    stdout_handler.setFormatter(fmt)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setFormatter(fmt)
+
+    logger.addHandler(stdout_handler)
+    logger.addHandler(stderr_handler)
+
 
 def make_session() -> requests.Session:
     session = requests.Session()
@@ -47,26 +77,30 @@ def make_session() -> requests.Session:
     session.mount("https://", adapter)
     return session
 
+
 def get_value(row: Dict, key: str) -> str:
-    if key in row and row[key] is not None:
-        return str(row[key])
-    if key == "antigen_id":
-        return str(row.get("epitope__source_molecule_iri", "") or "")
+    if key == "source_id":
+        return str(row.get("epitope__source_molecule_iri", "") or "").strip()
+
+    if key == "parent_id":
+        return str(row.get("epitope__molecule_parent_iri", "") or "").strip()
+
     if key == "protein_id":
-        return str(row.get("epitope__molecule_parent_iri", "") or "")
+        return str(row.get("epitope__molecule_parent_iri", "") or "").strip()
+
+    if key in row and row[key] is not None:
+        return str(row[key]).strip()
+
     return ""
 
+
 def canonical_epitope(ep_name: str) -> str:
-    """
-    Convierte 'YILKPLPL + MCM(K4)' -> 'YILKPLPL'
-    Convierte ' SIINFEKL ' -> 'SIINFEKL'
-    Si no encuentra nada, devuelve "".
-    """
     if not ep_name:
         return ""
     ep_name = ep_name.strip().upper()
     m = AA_BLOCK_RE.search(ep_name)
     return m.group(1) if m else ""
+
 
 def fetch_all(base_url: str, params: Dict, timeout: int = 120) -> List[Dict]:
     all_rows: List[Dict] = []
@@ -78,26 +112,12 @@ def fetch_all(base_url: str, params: Dict, timeout: int = 120) -> List[Dict]:
         p = dict(params)
         p["offset"] = page * limit
 
-        success = False
-        data = None
-
-        for attempt in range(5):
-            try:
-                r = session.get(base_url, params=p, timeout=timeout)
-                r.raise_for_status()
-                data = r.json()
-                success = True
-                break
-            except Exception as e:
-                wait_s = 2 ** attempt
-                logging.warning(
-                    "Error en %s page=%d offset=%d intento=%d: %s. Reintentando en %ds...",
-                    base_url, page, p["offset"], attempt + 1, e, wait_s
-                )
-                time.sleep(wait_s)
-
-        if not success:
-            logging.error("Fallo definitivo en %s page=%d offset=%d", base_url, page, p["offset"])
+        try:
+            r = session.get(base_url, params=p, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            logging.error("Error en %s offset=%d: %s", base_url, p["offset"], e)
             break
 
         logging.info(
@@ -116,94 +136,63 @@ def fetch_all(base_url: str, params: Dict, timeout: int = 120) -> List[Dict]:
 
     return all_rows
 
+
 def write_full_csv(rows: List[Dict], out_path: Path) -> None:
     if not rows:
         out_path.write_text("", encoding="utf-8")
         return
-    all_keys = sorted({k for row in rows for k in row.keys()})
+
+    keys = sorted({k for r in rows for k in r.keys()})
+
     with out_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=all_keys)
+        w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
         w.writerows(rows)
 
-def write_filtered_outputs(rows: List[Dict], out_dir: Path, prefix: str) -> None:
-    """
-    Genera:
-      - <prefix>_unique_epitopes.csv  (1 fila por epítopo canonical)
-      - <prefix>_unique_events.csv    (dedupe por epitope canonical + start/end + antigen_id + protein_id)
-      - <prefix>_epitope_counts.csv   (conteo por epítopo canonical)
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    counts: Dict[str, int] = {}
-
-    seen_epi = set()
-    unique_epitopes: List[Tuple[str, str, str, str, str]] = []
-
-    seen_evt = set()
-    unique_events: List[Tuple[str, str, str, str, str]] = []
+def build_merged_unique_events(rows: List[Dict], out_dir: Path) -> None:
+    seen = set()
+    result = []
 
     for row in rows:
-        raw = get_value(row, "epitope__name")
-        epi = canonical_epitope(raw)
+        epi = canonical_epitope(get_value(row, "epitope__name"))
         if not epi:
             continue
 
         start = get_value(row, "epitope__starting_position")
         end = get_value(row, "epitope__ending_position")
-        antigen = get_value(row, "antigen_id")
-        protein = get_value(row, "protein_id")
+        if not start or not end:
+            continue
 
-        counts[epi] = counts.get(epi, 0) + 1
+        source_id = get_value(row, "source_id")
+        parent_id = get_value(row, "parent_id")
+        protein_id = parent_id
 
-        epi_key = epi
-        evt_key = (epi, start, end, antigen, protein)
+        key = (epi, start, end, source_id, parent_id)
 
-        if epi_key not in seen_epi:
-            seen_epi.add(epi_key)
-            unique_epitopes.append((epi, start, end, antigen, protein))
+        if key not in seen:
+            seen.add(key)
+            result.append((epi, start, end, source_id, parent_id, protein_id))
 
-        if evt_key not in seen_evt:
-            seen_evt.add(evt_key)
-            unique_events.append((epi, start, end, antigen, protein))
+    out_file = out_dir / "merged_unique_events.csv"
 
-    header = [
-        "epitope__name_canonical",
-        "epitope__starting_position",
-        "epitope__ending_position",
-        "antigen_id",
-        "protein_id",
-    ]
-
-    with (out_dir / f"{prefix}_unique_epitopes.csv").open("w", newline="", encoding="utf-8") as f:
+    with out_file.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(header)
-        w.writerows(unique_epitopes)
+        w.writerow([
+            "epitope__name_canonical",
+            "epitope__starting_position",
+            "epitope__ending_position",
+            "source_id",
+            "parent_id",
+            "protein_id",
+        ])
+        w.writerows(result)
 
-    with (out_dir / f"{prefix}_unique_events.csv").open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        w.writerows(unique_events)
-
-    with (out_dir / f"{prefix}_epitope_counts.csv").open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["epitope__name_canonical", "n_rows_in_export"])
-        for epi in sorted(counts.keys()):
-            w.writerow([epi, counts[epi]])
-
-    logging.info(
-        "%s: unique_epitopes=%d | unique_events=%d | total_rows=%d",
-        prefix,
-        len(unique_epitopes),
-        len(unique_events),
-        len(rows),
-    )
+    logging.info("MERGED -> %s (n=%d)", out_file, len(result))
 
 
-
-def fetch_pipeline(species: str, class_type: str, haplotype: str, mode: str, class_num: str, root: Path) -> None:
+def fetch_pipeline(species, class_type, haplotype, mode, class_num):
     base_url = BASE_MHC if mode == "mhc" else BASE_TCELL
-    page_limit = 500 if mode == "mhc" else 1000
 
     params = {
         "epitope__object_type": "eq.Linear peptide",
@@ -212,58 +201,16 @@ def fetch_pipeline(species: str, class_type: str, haplotype: str, mode: str, cla
         "host__name": f"ilike.*{SPECIES_QUERY[species]}*",
         "mhc_restriction__name": f"ilike.*{haplotype}*",
         "epitope__source_organism": f"ilike.*{SPECIES_QUERY[species]}*",
-        "order": "assay_id.asc",
-        "limit": page_limit,
+        "limit": 500 if mode == "mhc" else 1000,
         "offset": 0,
     }
 
-    out_dir = root / species / class_type / haplotype
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     logging.info("=== %s %s %s %s ===", species, class_type, haplotype, mode)
-    rows = fetch_all(base_url, params=params)
+    return fetch_all(base_url, params)
 
-    full_path = out_dir / f"{mode}_export_full.csv"
-    write_full_csv(rows, full_path)
-
-    write_filtered_outputs(rows, out_dir, mode)
-
-def merge_unique_epitopes(out_dir: Path) -> None:
-    mhc_u = out_dir / "mhc_unique_epitopes.csv"
-    tcell_u = out_dir / "tcell_unique_epitopes.csv"
-
-    merged = {}
-    header = [
-        "epitope__name_canonical",
-        "epitope__starting_position",
-        "epitope__ending_position",
-        "antigen_id",
-        "protein_id",
-    ]
-
-    def load_unique(path: Path):
-        if not path.exists():
-            return
-        with path.open("r", encoding="utf-8") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                epi = row["epitope__name_canonical"]
-                merged.setdefault(epi, row)
-
-    load_unique(mhc_u)
-    load_unique(tcell_u)
-
-    merged_path = out_dir / "merged_unique_epitopes.csv"
-    with merged_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        w.writeheader()
-        for epi in sorted(merged.keys()):
-            w.writerow(merged[epi])
-
-    logging.info("MERGED unique epitopes -> %s (n=%d)", merged_path, len(merged))
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+    setup_logging()
     root = Path("/home/nap/lperez_nn/data/data_raw")
 
     for species in ["mouse", "human"]:
@@ -272,11 +219,17 @@ def main():
             ("mhc-II", "II", HAPLOTYPES_II),
         ]:
             for haplotype in haps[species]:
-                fetch_pipeline(species, class_type, haplotype, "mhc", class_num, root)
-                fetch_pipeline(species, class_type, haplotype, "tcell", class_num, root)
 
                 out_dir = root / species / class_type / haplotype
-                merge_unique_epitopes(out_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                rows_mhc = fetch_pipeline(species, class_type, haplotype, "mhc", class_num)
+                rows_tcell = fetch_pipeline(species, class_type, haplotype, "tcell", class_num)
+
+                write_full_csv(rows_mhc, out_dir / "mhc_export_full.csv")
+                write_full_csv(rows_tcell, out_dir / "tcell_export_full.csv")
+
+                build_merged_unique_events(rows_mhc + rows_tcell, out_dir)
 
     logging.info("DONE")
 
