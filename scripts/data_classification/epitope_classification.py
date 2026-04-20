@@ -11,10 +11,7 @@ import pandas as pd
 DATA_RAW = Path("/home/nap/lperez_nn/data/data_raw")
 DATA_INTERMEDIATE = Path("/home/nap/lperez_nn/data/data_intermediate")
 
-WINDOW_SIZE = {
-    "human": 25,
-    "mouse": 12,
-}
+WINDOW_SIZE = 25
 
 
 def fasta_to_sequence(fasta_text: str) -> str:
@@ -87,7 +84,7 @@ def classify_one_haplotype(
     haplotype: str,
     seq_map: Dict[str, str],
 ) -> None:
-    window_size = WINDOW_SIZE[species]
+    window_size = WINDOW_SIZE
 
     epitope_file = DATA_RAW / species / class_type / haplotype / "merged_unique_events.csv"
     if not epitope_file.exists():
@@ -157,7 +154,6 @@ def classify_one_haplotype(
         if prot_epitopes.empty:
             continue
 
-        # quedarse solo con epítopos que casan exactamente en la proteína
         prot_epitopes["exact_match"] = prot_epitopes.apply(
             lambda r: validate_exact_match(
                 protein_seq=seq,
@@ -218,7 +214,7 @@ def classify_one_haplotype(
                 ])
 
     output_cols = [
-        f"{window_size}aa_seq",
+        "25aa_seq",
         "contains_epitope",
         "selected_epitope",
         "epitope_pos_score",

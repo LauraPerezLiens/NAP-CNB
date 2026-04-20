@@ -49,14 +49,40 @@ def build_variants(seq):
 def detect_seq_column(df):
     if "25aa_seq" in df.columns:
         return "25aa_seq"
-    if "12aa_seq" in df.columns:
-        return "12aa_seq"
-    raise ValueError("No encuentro ni '25aa_seq' ni '12aa_seq' en el input.")
+    raise ValueError("No encuentro '25aa_seq' en el input.")
+
+
+def flush_buffer(rows_buffer, output_path, write_header):
+    if not rows_buffer:
+        return write_header, 0
+
+    chunk_df = pd.DataFrame(
+        rows_buffer,
+        columns=[
+            "original_seq",
+            "blosum_seq",
+            "group_id",
+            "contains_epitope",
+            "selected_epitope",
+            "epitope_pos_score",
+        ],
+    )
+
+    chunk_df.to_csv(
+        output_path,
+        mode="w" if write_header else "a",
+        header=write_header,
+        index=False,
+        float_format="%.3f"
+    )
+
+    written = len(chunk_df)
+    return False, written
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Uso: python blosum_augmentation.py input.csv [output.csv]")
+        print("Uso: python blosum62.py input.csv [output.csv]")
         sys.exit(1)
 
     input_path = sys.argv[1]
@@ -71,57 +97,58 @@ def main():
 
     seq_col = detect_seq_column(df)
 
-    required_cols = [seq_col, "contains_epitope", "epitope_pos_score"]
+    required_cols = [seq_col, "contains_epitope", "selected_epitope", "epitope_pos_score"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Faltan columnas en el input: {missing}")
 
-    df = df[required_cols].drop_duplicates().reset_index(drop=True)
+    df = df[required_cols].reset_index(drop=True)
 
     print(f"Input rows: {len(df)}")
     print(f"Unique {seq_col}: {df[seq_col].nunique()}")
 
-    all_rows = []
+    rows_buffer = []
+    write_header = True
+    chunk_size = 100000
+    total_output_rows = 0
+    total_groups = 0
 
-    for group_id, row in enumerate(df.itertuples(index=False), start=1):
-        original_seq = str(getattr(row, seq_col)).strip().upper()
-        contains_epitope = int(row.contains_epitope)
-        epitope_pos_score = row.epitope_pos_score
+    for group_id, (_, row) in enumerate(df.iterrows(), start=1):
+        original_seq = str(row[seq_col]).strip().upper()
+        contains_epitope = int(row["contains_epitope"])
+        selected_epitope = row["selected_epitope"]
+        epitope_pos_score = row["epitope_pos_score"]
 
         if not original_seq:
             continue
 
+        total_groups += 1
         variants = build_variants(original_seq)
 
         for blosum_seq in variants:
-            all_rows.append([
+            rows_buffer.append([
                 original_seq,
                 blosum_seq,
                 group_id,
                 contains_epitope,
+                selected_epitope,
                 epitope_pos_score,
             ])
 
-    out_df = pd.DataFrame(
-        all_rows,
-        columns=[
-            "original_seq",
-            "blosum_seq",
-            "group_id",
-            "contains_epitope",
-            "epitope_pos_score",
-        ],
-    )
+        if len(rows_buffer) >= chunk_size:
+            write_header, written = flush_buffer(rows_buffer, output_path, write_header)
+            total_output_rows += written
+            rows_buffer = []
 
-    out_df.to_csv(
-        output_path,
-        index=False,
-        float_format="%.3f"
-    )
+        if group_id % 100000 == 0:
+            print(f"Processed groups: {group_id}")
+
+    write_header, written = flush_buffer(rows_buffer, output_path, write_header)
+    total_output_rows += written
 
     print(f"Saved: {output_path}")
-    print(f"Output rows: {len(out_df)}")
-    print(f"Groups: {out_df['group_id'].nunique()}")
+    print(f"Output rows: {total_output_rows}")
+    print(f"Groups: {total_groups}")
 
 
 if __name__ == "__main__":
