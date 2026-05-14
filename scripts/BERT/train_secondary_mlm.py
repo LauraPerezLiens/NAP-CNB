@@ -31,19 +31,19 @@ OUTPUT_DIR = (
 # TRAINING PARAMETERS
 # =========================================================
 
-MAX_LEN = 512
+WINDOW_SIZE= 25
+MAX_LEN = 30
 MLM_PROBABILITY = 0.15
 
-HIDDEN_SIZE = 128
-NUM_LAYERS = 4
-NUM_HEADS = 4
-INTERMEDIATE_SIZE = 512
+HIDDEN_SIZE = 768
+NUM_LAYERS = 12
+NUM_HEADS = 12
+INTERMEDIATE_SIZE = 3072
 
-BATCH_SIZE = 128
-NUM_EPOCHS = 3
+BATCH_SIZE = 32
+MAX_STEPS= 500_000
 
 # =========================================================
-
 
 def main():
 
@@ -76,25 +76,39 @@ def main():
     # TOKENIZATION
     # =====================================================
 
+    def crop_secondary_structure(ss_spaced):
+            ss = ss_spaced.replace(" ", "").strip()
+
+            if len(ss) > WINDOW_SIZE:
+                ss = ss[:WINDOW_SIZE]
+
+            return " ".join(ss)
+
     def tokenize_function(examples):
 
-        return tokenizer(
-            examples["secondary_structure_spaced"],
-            truncation=True,
-            max_length=MAX_LEN,
-            padding=False,
-            return_special_tokens_mask=True,
-        )
+            cropped_sequences = [
+                crop_secondary_structure(ss)
+                for ss in examples["secondary_structure_spaced"]
+            ]
+
+            return tokenizer(
+                cropped_sequences,
+                truncation=True,
+                max_length=MAX_LEN,
+                padding=False,
+                return_special_tokens_mask=True,
+            )
 
     print("\n[INFO] Tokenizing dataset...")
 
     tokenized_dataset = dataset.map(
-        tokenize_function,
-        batched=True,
-        num_proc=8,
-        remove_columns=dataset["train"].column_names,
-        desc="Tokenizing secondary structure sequences",
-    )
+            tokenize_function,
+            batched=True,
+            num_proc=8,
+            remove_columns=dataset["train"].column_names,
+            desc="Tokenizing secondary structure sequences",
+        )
+
 
     # =====================================================
     # MODEL CONFIG
@@ -102,6 +116,7 @@ def main():
 
     print("\n[INFO] Building BERT config...")
 
+ 
     config = BertConfig(
         vocab_size=tokenizer.vocab_size,
         hidden_size=HIDDEN_SIZE,
@@ -136,14 +151,13 @@ def main():
 
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        overwrite_output_dir=True,
 
-        num_train_epochs=NUM_EPOCHS,
+        max_steps=MAX_STEPS,
 
         per_device_train_batch_size=BATCH_SIZE,
         per_device_eval_batch_size=BATCH_SIZE,
 
-        learning_rate=5e-4,
+        learning_rate=1e-4,
         weight_decay=0.01,
         warmup_ratio=0.05,
 
@@ -166,6 +180,7 @@ def main():
         remove_unused_columns=False,
     )
 
+
     # =====================================================
     # TRAINER
     # =====================================================
@@ -176,7 +191,6 @@ def main():
         train_dataset=tokenized_dataset["train"],
         eval_dataset=tokenized_dataset["validation"],
         data_collator=data_collator,
-        tokenizer=tokenizer,
     )
 
     # =====================================================
