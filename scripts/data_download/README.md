@@ -18,10 +18,9 @@ It retrieves both **MHC binding assays** and **T-cell assays**, merges them, and
 ## Output structure
 
 Data is stored in:
-
-
+```python
 /home/nap/lperez_nn/data/data_raw/
-
+```
 
 Organized as:
 
@@ -31,7 +30,7 @@ species / mhc-class / haplotype
 
 Example:
 
-
+```python
 data_raw/
 ├── human/
 │ ├── mhc-I/
@@ -39,7 +38,7 @@ data_raw/
 │ │ │ ├── mhc_export_full.csv
 │ │ │ ├── tcell_export_full.csv
 │ │ │ └── merged_unique_events.csv
-
+```
 
 ---
 
