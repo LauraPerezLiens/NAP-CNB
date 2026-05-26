@@ -99,9 +99,9 @@ Each row corresponds to a 25 amino acid window:
 
 The epitope_pos_score represents the relative position of the epitope inside the window:
 
-- 0.0 → epitope centered
-- < 0 → shifted to the left
-- > 0 → shifted to the right
+- `0.0` → epitope centered
+- `< 0` → shifted to the left
+- `> 0` → shifted to the right
 - Range: [-1, 1]
 
 #### Data filtering
