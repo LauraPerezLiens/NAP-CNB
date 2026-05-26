@@ -24,9 +24,9 @@ Data is stored in:
 
 Organized as:
 
-
+```python
 species / mhc-class / haplotype
-
+```
 
 Example:
 
@@ -97,7 +97,9 @@ This extracts the amino acid sequence from the epitope name.
 
 Entries are considered duplicates if they share:
 
+```python
 (epitope sequence, start, end, source_id, parent_id)
+```
 
 ---
 
