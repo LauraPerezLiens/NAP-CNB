@@ -5,21 +5,33 @@ import csv
 import logging
 import re
 import sys
-import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+
+# =========================
+# CONFIGURATION
+# =========================
+
 BASE_MHC = "https://query-api.iedb.org/mhc_export"
 BASE_TCELL = "https://query-api.iedb.org/tcell_export"
+
+OUTPUT_ROOT = Path("/home/nap/lperez_nn/data/data_raw")
+
+# Use a single limit for simplicity and consistency
+LIMIT = 1000
+REQUEST_TIMEOUT = 120
+
 
 HAPLOTYPES_I = {
     "mouse": ["H2-K", "H2-D", "H2-L"],
     "human": ["HLA-A", "HLA-B", "HLA-C"],
 }
+
 HAPLOTYPES_II = {
     "mouse": ["H2-IA", "H2-IE"],
     "human": ["HLA-DR", "HLA-DQ", "HLA-DP"],
@@ -30,10 +42,17 @@ SPECIES_QUERY = {
     "human": "Homo sapiens",
 }
 
+# Regex to extract amino acid sequences from epitope names
 AA_BLOCK_RE = re.compile(r"([A-Z]+)")
 
 
+# =========================
+# LOGGING
+# =========================
+
 class MaxLevelFilter(logging.Filter):
+    """Filter log records up to a maximum logging level."""
+
     def __init__(self, max_level: int) -> None:
         super().__init__()
         self.max_level = max_level
@@ -43,6 +62,8 @@ class MaxLevelFilter(logging.Filter):
 
 
 def setup_logging() -> None:
+    """Configure logging: INFO → stdout, WARNING/ERROR → stderr."""
+
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
@@ -62,8 +83,15 @@ def setup_logging() -> None:
     logger.addHandler(stderr_handler)
 
 
+# =========================
+# REQUESTS SESSION
+# =========================
+
 def make_session() -> requests.Session:
+    """Create a requests session with retry strategy."""
+
     session = requests.Session()
+
     retry = Retry(
         total=5,
         connect=5,
@@ -72,13 +100,21 @@ def make_session() -> requests.Session:
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
     )
+
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
+
     return session
 
 
+# =========================
+# DATA PROCESSING
+# =========================
+
 def get_value(row: Dict, key: str) -> str:
+    """Safely extract values from API row."""
+
     if key == "source_id":
         return str(row.get("epitope__source_molecule_iri", "") or "").strip()
 
@@ -95,30 +131,42 @@ def get_value(row: Dict, key: str) -> str:
 
 
 def canonical_epitope(ep_name: str) -> str:
+    """Extract canonical amino acid sequence from epitope name."""
+
     if not ep_name:
         return ""
+
     ep_name = ep_name.strip().upper()
-    m = AA_BLOCK_RE.search(ep_name)
-    return m.group(1) if m else ""
+    match = AA_BLOCK_RE.search(ep_name)
+
+    return match.group(1) if match else ""
 
 
-def fetch_all(base_url: str, params: Dict, timeout: int = 120) -> List[Dict]:
+# =========================
+# API FETCHING
+# =========================
+
+def fetch_all(base_url: str, params: Dict) -> List[Dict]:
+    """Fetch all pages from API using offset-based pagination."""
+
     all_rows: List[Dict] = []
     page = 0
-    limit = int(params.get("limit", 1000))
+
     session = make_session()
 
     while True:
         p = dict(params)
-        p["offset"] = page * limit
+        p["offset"] = page * LIMIT
 
         try:
-            r = session.get(base_url, params=p, timeout=timeout)
-            r.raise_for_status()
-            data = r.json()
+            response = session.get(base_url, params=p, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+
         except Exception as e:
-            logging.error("Error en %s offset=%d: %s", base_url, p["offset"], e)
-            break
+            # Critical: stop execution if API fails to avoid incomplete datasets
+            logging.error("Error fetching %s offset=%d: %s", base_url, p["offset"], e)
+            raise
 
         logging.info(
             "GET %s page=%d offset=%d n=%d",
@@ -138,19 +186,24 @@ def fetch_all(base_url: str, params: Dict, timeout: int = 120) -> List[Dict]:
 
 
 def write_full_csv(rows: List[Dict], out_path: Path) -> None:
+    """Write raw API data to CSV."""
+
     if not rows:
+        logging.warning("No data for %s", out_path)
         out_path.write_text("", encoding="utf-8")
         return
 
     keys = sorted({k for r in rows for k in r.keys()})
 
     with out_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        w.writerows(rows)
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def build_merged_unique_events(rows: List[Dict], out_dir: Path) -> None:
+    """Build deduplicated dataset of epitope events."""
+
     seen = set()
     result = []
 
@@ -177,8 +230,8 @@ def build_merged_unique_events(rows: List[Dict], out_dir: Path) -> None:
     out_file = out_dir / "merged_unique_events.csv"
 
     with out_file.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
+        writer = csv.writer(f)
+        writer.writerow([
             "epitope__name_canonical",
             "epitope__starting_position",
             "epitope__ending_position",
@@ -186,12 +239,14 @@ def build_merged_unique_events(rows: List[Dict], out_dir: Path) -> None:
             "parent_id",
             "protein_id",
         ])
-        w.writerows(result)
+        writer.writerows(result)
 
     logging.info("MERGED -> %s (n=%d)", out_file, len(result))
 
 
-def fetch_pipeline(species, class_type, haplotype, mode, class_num):
+def fetch_pipeline(species: str, class_type: str, haplotype: str, mode: str, class_num: str) -> List[Dict]:
+    """Prepare query parameters and fetch data."""
+
     base_url = BASE_MHC if mode == "mhc" else BASE_TCELL
 
     params = {
@@ -201,17 +256,21 @@ def fetch_pipeline(species, class_type, haplotype, mode, class_num):
         "host__name": f"ilike.*{SPECIES_QUERY[species]}*",
         "mhc_restriction__name": f"ilike.*{haplotype}*",
         "epitope__source_organism": f"ilike.*{SPECIES_QUERY[species]}*",
-        "limit": 500 if mode == "mhc" else 1000,
+        "limit": LIMIT,
         "offset": 0,
     }
 
     logging.info("=== %s %s %s %s ===", species, class_type, haplotype, mode)
+
     return fetch_all(base_url, params)
 
 
+# =========================
+# MAIN
+# =========================
+
 def main():
     setup_logging()
-    root = Path("/home/nap/lperez_nn/data/data_raw")
 
     for species in ["mouse", "human"]:
         for class_type, class_num, haps in [
@@ -220,7 +279,7 @@ def main():
         ]:
             for haplotype in haps[species]:
 
-                out_dir = root / species / class_type / haplotype
+                out_dir = OUTPUT_ROOT / species / class_type / haplotype
                 out_dir.mkdir(parents=True, exist_ok=True)
 
                 rows_mhc = fetch_pipeline(species, class_type, haplotype, "mhc", class_num)

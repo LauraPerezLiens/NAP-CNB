@@ -1,4 +1,4 @@
-# download_iedb_epitopes.py
+# build_iedb_dataset.py
 
 ## Overview
 
@@ -18,19 +18,19 @@ It retrieves both **MHC binding assays** and **T-cell assays**, merges them, and
 ## Output structure
 
 Data is stored in:
-```python
+```bash
 /home/nap/lperez_nn/data/data_raw/
 ```
 
 Organized as:
 
-```python
+```bash
 species / mhc-class / haplotype
 ```
 
 Example:
 
-```python
+```bash
 data_raw/
 ├── human/
 │ ├── mhc-I/
@@ -48,7 +48,7 @@ For each haplotype:
 
 - `mhc_export_full.csv` → raw MHC data from IEDB  
 - `tcell_export_full.csv` → raw T-cell data from IEDB  
-- `merged_unique_events.csv` → processed and deduplicated dataset  
+- `merged_unique_events.csv` → **final processed dataset**
 
 ---
 
@@ -103,43 +103,49 @@ Entries are considered duplicates if they share:
 
 ---
 
-### Key functions
-- fetch_all() → handles API pagination and retries
-- fetch_pipeline() → builds query parameters for each condition
+## Key functions
+- fetch_all() → API pagination with retry logic
+- fetch_pipeline() → builds query parameters
 - canonical_epitope() → extracts amino acid sequence
-- build_merged_unique_events() → filters and deduplicates data
+- build_merged_unique_events() → filtering and deduplication
 - write_full_csv() → saves raw data
 
 ---
 
-### Technical details
+## Technical details
 - Uses retry logic for robust API calls
 - Pagination:
-  - MHC → limit = 500
-  - T-cell → limit = 1000
+  - limit = 1000 (applied to both MHC and T-cell endpoints)
 - Logging:
-  - INFO → progress and counts
+  - INFO → progress tracking
   - WARNING/ERROR → API issues
+
+---
+## Error handling
+
+If an API request fails, the script **raises an exception and stops execution**.
+
+This prevents generating incomplete or corrupted datasets.
 
 --- 
 
-### Usage
+## Usage
 
 Run:
 ```bash
-python3 download_iedb_epitopes.py
+python3 build_iedb_dataset.py
 ```
 
 --- 
 
-### Notes
+## Notes
 - Output size depends on IEDB content and filters
 - Some entries are discarded due to missing or invalid data
-- protein_id is derived from parent_id
+- *protein_id* is derived from *parent_id*
 - Dataset quality depends on IEDB consistency
 
 ---
 
-### Summary
+## Summary
 
-This script is the data ingestion step of the pipeline, responsible for generating the base dataset used in downstream processing and model training.
+This script is the **data ingestion step of the pipeline**, responsible for generating the base dataset used in downstream processing and model training.
