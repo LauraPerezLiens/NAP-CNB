@@ -1,85 +1,144 @@
-# Data download – IEDB epitopes
+# download_iedb_epitopes.py
 
-This module downloads epitope data from the IEDB API and prepares the raw dataset used by the NAP-CNB pipeline.
+## Overview
 
-## Source database
+This script downloads epitope data from the IEDB API and generates a **processed, deduplicated dataset of epitope events**.
 
-Data are retrieved from the Immune Epitope Database (IEDB):
+It retrieves both **MHC binding assays** and **T-cell assays**, merges them, and produces a clean dataset per species, MHC class, and haplotype.
 
-https://www.iedb.org
+---
 
-Using the public API:
+## Data sources
 
-- https://query-api.iedb.org/mhc_export
-- https://query-api.iedb.org/tcell_export
+- MHC assays: https://query-api.iedb.org/mhc_export  
+- T-cell assays: https://query-api.iedb.org/tcell_export  
 
-## Downloaded data
-
-The script downloads epitopes for:
-
-Species:
-- Homo sapiens
-- Mus musculus
-
-MHC classes:
-- MHC class I
-- MHC class II
-
-Haplotypes:
-
-Human  
-- HLA-A
-- HLA-B
-- HLA-C
-- HLA-DR
-- HLA-DQ
-- HLA-DP
-
-Mouse  
-- H2-K
-- H2-D
-- H2-L
-- H2-IA
-- H2-IE
-
-Only **positive assays** are retrieved.
+---
 
 ## Output structure
 
-The data are stored in:
-data/data_raw/
+Data is stored in:
 
 
-Each folder contains:
-
-### Full export
-mhc_export_full.csv
-tcell_export_full.csv
+/home/nap/lperez_nn/data/data_raw/
 
 
-Raw data returned by the API.
-
-### Processed outputs
-mhc_unique_epitopes.csv
-tcell_unique_epitopes.csv
-merged_unique_epitopes.csv
-mhc_epitope_counts.csv
-tcell_epitope_counts.csv
+Organized as:
 
 
-These files contain:
-
-- canonical epitope sequences
-- start and end positions
-- antigen identifiers
-- protein identifiers
-- epitope frequency counts
+species / mhc-class / haplotype
 
 
-## Role in the NAP-CNB pipeline
+Example:
 
-This script represents **Step 1 of the pipeline**:
 
-1. Download epitope data from IEDB  
-2. Generate curated epitope tables  
-3. Provide input data for downstream feature extraction and model training
+data_raw/
+├── human/
+│ ├── mhc-I/
+│ │ ├── HLA-A/
+│ │ │ ├── mhc_export_full.csv
+│ │ │ ├── tcell_export_full.csv
+│ │ │ └── merged_unique_events.csv
+
+
+---
+
+## Output files
+
+For each haplotype:
+
+- `mhc_export_full.csv` → raw MHC data from IEDB  
+- `tcell_export_full.csv` → raw T-cell data from IEDB  
+- `merged_unique_events.csv` → processed and deduplicated dataset  
+
+---
+
+## Filtering criteria
+
+The script applies the following filters when querying IEDB:
+
+- Linear peptides only  
+- Positive assays only  
+- Species-specific filtering:
+  - human → *Homo sapiens*
+  - mouse → *Mus musculus*
+- MHC class I and II  
+- Specific haplotypes (e.g., HLA-A, HLA-B, H2-K, etc.)
+
+---
+
+## Processing pipeline
+
+1. Query IEDB API with pagination  
+2. Retrieve MHC and T-cell datasets  
+3. Save raw datasets (`*_export_full.csv`)  
+4. Merge both datasets  
+5. Extract canonical epitope sequence  
+6. Filter invalid entries:
+   - Missing epitope
+   - Missing start/end positions  
+7. Remove duplicates  
+8. Save final dataset (`merged_unique_events.csv`)  
+
+---
+
+## Canonical epitope extraction
+
+Epitope sequences are normalized using:
+
+```python
+([A-Z]+)
+```
+
+This extracts the amino acid sequence from the epitope name.
+
+---
+
+## Deduplication criteria
+
+Entries are considered duplicates if they share:
+
+(epitope sequence, start, end, source_id, parent_id)
+
+---
+
+### Key functions
+- fetch_all() → handles API pagination and retries
+- fetch_pipeline() → builds query parameters for each condition
+- canonical_epitope() → extracts amino acid sequence
+- build_merged_unique_events() → filters and deduplicates data
+- write_full_csv() → saves raw data
+
+---
+
+### Technical details
+- Uses retry logic for robust API calls
+- Pagination:
+  - MHC → limit = 500
+  - T-cell → limit = 1000
+- Logging:
+  - INFO → progress and counts
+  - WARNING/ERROR → API issues
+
+--- 
+
+### Usage
+
+Run:
+```bash
+python3 download_iedb_epitopes.py
+```
+
+--- 
+
+### Notes
+- Output size depends on IEDB content and filters
+- Some entries are discarded due to missing or invalid data
+- protein_id is derived from parent_id
+- Dataset quality depends on IEDB consistency
+
+---
+
+### Summary
+
+This script is the data ingestion step of the pipeline, responsible for generating the base dataset used in downstream processing and model training.
