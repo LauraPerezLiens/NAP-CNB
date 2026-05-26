@@ -85,9 +85,8 @@ For each protein:
 2. Validates epitope positions (exact match with sequence)
 3. Generates sliding windows of 25 amino acids
 4. Labels each window:
-
-  - 1 → contains epitope
-  - 0 → does not contain epitope
+   - 1 → contains epitope
+   - 0 → does not contain epitope
 
 #### Window representation
 
