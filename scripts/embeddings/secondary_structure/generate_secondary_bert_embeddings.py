@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from pathlib import Path
 import argparse
 import json
+import logging
+import shutil
+import sys
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
-from transformers import BertTokenizerFast, BertForMaskedLM
+from transformers import BertForMaskedLM, BertTokenizerFast
 
+
+# ======================================================
+# PATHS
+# ======================================================
 
 DATA_INTERMEDIATE = Path("/home/nap/lperez_nn/data/data_intermediate")
 DATA_INPUT_NN = Path("/data/nap/lperez_nn/data/data_input_nn")
 MODEL_DIR = Path("/home/nap/lperez_nn/model/secondary_bert_mlm")
+
+
+# ======================================================
+# INPUT COLUMNS
+# ======================================================
 
 GROUP_COL = "group_id"
 SEQ_COL = "25aa_seq"
@@ -24,21 +37,80 @@ PROTEIN_COL = "protein_url"
 WINDOW_COL = "window_start"
 STATUS_COL = "ss_status"
 
+
+# ======================================================
+# PARAMETERS
+# ======================================================
+
 BATCH_SIZE = 512
-CHUNK_SIZE = 102400
+CHUNK_SIZE = 102_400
 MAX_LEN = 30
 WINDOW_SIZE = 25
 HIDDEN_SIZE = 768
 SAVE_DTYPE = np.float32
 
+VALID_SS = {"C", "H", "E"}
+
+
+# ======================================================
+# LOGGING
+# ======================================================
+
+class MaxLevelFilter(logging.Filter):
+    """Filter log records up to a maximum logging level."""
+
+    def __init__(self, max_level: int) -> None:
+        super().__init__()
+        self.max_level = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno <= self.max_level
+
+
+def setup_logging() -> None:
+    """Configure logging: INFO goes to stdout, WARNING/ERROR goes to stderr."""
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
+    stdout_handler.addFilter(MaxLevelFilter(logging.INFO))
+    stdout_handler.setFormatter(formatter)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setFormatter(formatter)
+
+    logger.addHandler(stdout_handler)
+    logger.addHandler(stderr_handler)
+
+
+# ======================================================
+# SECONDARY STRUCTURE PREPROCESSING
+# ======================================================
 
 def clean_secondary_structure(ss: str) -> str:
+    """
+    Clean and normalize a secondary structure string.
+
+    Valid labels are:
+        C -> coil
+        H -> helix
+        E -> beta strand
+
+    Invalid characters are mapped to C.
+    Sequences are truncated or padded to WINDOW_SIZE.
+    """
+
     if pd.isna(ss):
         return ""
 
     ss = str(ss).replace(" ", "").strip().upper()
-    valid = {"C", "H", "E"}
-    ss = "".join([x if x in valid else "C" for x in ss])
+    ss = "".join([char if char in VALID_SS else "C" for char in ss])
 
     if len(ss) > WINDOW_SIZE:
         ss = ss[:WINDOW_SIZE]
@@ -50,32 +122,58 @@ def clean_secondary_structure(ss: str) -> str:
 
 
 def spaced_secondary_structure(ss: str) -> str:
+    """Convert secondary structure labels into BERT token format."""
+
     return " ".join(ss)
 
 
-def load_model_and_tokenizer(model_dir: Path):
-    print(f"[INFO] Loading Secondary BERT model from: {model_dir}", flush=True)
+# ======================================================
+# MODEL
+# ======================================================
+
+def load_model_and_tokenizer(
+    model_dir: Path,
+) -> Tuple[BertTokenizerFast, BertForMaskedLM, torch.device]:
+    """Load SecondaryBERT tokenizer and model."""
+
+    logging.info("Loading SecondaryBERT model from: %s", model_dir)
 
     tokenizer = BertTokenizerFast.from_pretrained(str(model_dir))
     model = BertForMaskedLM.from_pretrained(str(model_dir))
 
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
-        print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}", flush=True)
+        logging.info("GPU: %s", torch.cuda.get_device_name(0))
     else:
         device = torch.device("cpu")
 
     model = model.to(device)
     model.eval()
 
-    print(f"[INFO] Device: {device}", flush=True)
+    logging.info("Device: %s", device)
 
     return tokenizer, model, device
 
 
+# ======================================================
+# EMBEDDING GENERATION
+# ======================================================
+
 @torch.inference_mode()
-def embed_batch_secondary_structures(batch, tokenizer, model, device):
-    batch_spaced = [spaced_secondary_structure(s) for s in batch]
+def embed_batch_secondary_structures(
+    batch: List[str],
+    tokenizer: BertTokenizerFast,
+    model: BertForMaskedLM,
+    device: torch.device,
+) -> np.ndarray:
+    """
+    Generate token-level SecondaryBERT embeddings.
+
+    Output shape:
+        batch_size x WINDOW_SIZE x HIDDEN_SIZE
+    """
+
+    batch_spaced = [spaced_secondary_structure(ss) for ss in batch]
 
     tokens = tokenizer(
         batch_spaced,
@@ -95,8 +193,11 @@ def embed_batch_secondary_structures(batch, tokenizer, model, device):
     )
 
     hidden = outputs.last_hidden_state
+
+    # Remove [CLS] and keep only the 25 secondary structure positions.
     token_embeddings = hidden[:, 1:1 + WINDOW_SIZE, :]
 
+    # Safety padding if tokenization returns fewer than WINDOW_SIZE tokens.
     if token_embeddings.shape[1] < WINDOW_SIZE:
         pad_len = WINDOW_SIZE - token_embeddings.shape[1]
         padding = torch.zeros(
@@ -111,21 +212,34 @@ def embed_batch_secondary_structures(batch, tokenizer, model, device):
     return token_embeddings.float().cpu().numpy().astype(SAVE_DTYPE, copy=False)
 
 
-def build_output_dir(ss_csv_path: Path):
+# ======================================================
+# OUTPUT HELPERS
+# ======================================================
+
+def build_output_dir(ss_csv_path: Path) -> Path:
+    """Build output directory while preserving dataset hierarchy."""
+
     relative_parent = ss_csv_path.parent.relative_to(DATA_INTERMEDIATE)
     dataset_name = ss_csv_path.stem.replace("_ss", "")
 
     out_dir = (
-        DATA_INPUT_NN /
-        relative_parent /
-        f"{dataset_name}_SecondaryBERT_by_group"
+        DATA_INPUT_NN
+        / relative_parent
+        / f"{dataset_name}_SecondaryBERT_by_group"
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)
+
     return out_dir
 
 
-def save_metadata_and_index(df, group_ids, out_dir):
+def save_metadata_and_index(
+    df: pd.DataFrame,
+    group_ids: np.ndarray,
+    out_dir: Path,
+) -> None:
+    """Save metadata, group index and group ID array."""
+
     metadata_path = out_dir / "metadata.csv"
     group_index_path = out_dir / "group_index.csv"
     group_ids_path = out_dir / "group_ids.npy"
@@ -145,10 +259,10 @@ def save_metadata_and_index(df, group_ids, out_dir):
         "selected_epitope",
         "protein_found",
         "sequence_match",
-        "ss_status",
+        STATUS_COL,
     ]
 
-    metadata_cols += [c for c in optional_cols if c in df.columns]
+    metadata_cols += [col for col in optional_cols if col in df.columns]
 
     df[metadata_cols].to_csv(metadata_path, index=False)
 
@@ -160,12 +274,18 @@ def save_metadata_and_index(df, group_ids, out_dir):
     group_index_df.to_csv(group_index_path, index=False)
     np.save(group_ids_path, group_ids)
 
-    print(f"[OK] Saved metadata: {metadata_path}", flush=True)
-    print(f"[OK] Saved group index: {group_index_path}", flush=True)
-    print(f"[OK] Saved all group_ids: {group_ids_path}", flush=True)
+    logging.info("Saved metadata: %s", metadata_path)
+    logging.info("Saved group index: %s", group_index_path)
+    logging.info("Saved all group IDs: %s", group_ids_path)
 
 
-def chunk_is_valid(x_path: Path, gid_path: Path, expected_rows: int) -> bool:
+def chunk_is_valid(
+    x_path: Path,
+    gid_path: Path,
+    expected_rows: int,
+) -> bool:
+    """Check whether an existing chunk is complete and has the expected shape."""
+
     if not x_path.exists() or not gid_path.exists():
         return False
 
@@ -177,18 +297,89 @@ def chunk_is_valid(x_path: Path, gid_path: Path, expected_rows: int) -> bool:
             x.shape == (expected_rows, WINDOW_SIZE, HIDDEN_SIZE)
             and gids.shape[0] == expected_rows
         )
-    except Exception:
+
+    except Exception as exc:
+        logging.warning("Invalid existing chunk detected: %s", exc)
         return False
 
 
-def process_ss_csv(ss_csv_path: Path, tokenizer, model, device, batch_size: int, chunk_size: int):
-    print("=" * 80, flush=True)
-    print(f"[INFO] Processing: {ss_csv_path}", flush=True)
-    print("=" * 80, flush=True)
+def write_embedding_config(
+    config_path: Path,
+    ss_csv_path: Path,
+    total: int,
+    batch_size: int,
+    chunk_size: int,
+) -> None:
+    """Save embedding configuration for reproducibility."""
+
+    config = {
+        "source_csv": str(ss_csv_path),
+        "total_rows": int(total),
+        "batch_size": int(batch_size),
+        "chunk_size": int(chunk_size),
+        "window_size": int(WINDOW_SIZE),
+        "max_len": int(MAX_LEN),
+        "hidden_size": int(HIDDEN_SIZE),
+        "dtype": "float32",
+        "output_shape_per_row": [WINDOW_SIZE, HIDDEN_SIZE],
+        "model_dir": str(MODEL_DIR),
+    }
+
+    with config_path.open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+
+def remove_previous_outputs(out_dir: Path) -> None:
+    """Remove previous outputs when --force is enabled."""
+
+    logging.info("Force enabled. Removing previous outputs in: %s", out_dir)
+
+    for item in [
+        out_dir / "group_ids.npy",
+        out_dir / "metadata.csv",
+        out_dir / "group_index.csv",
+        out_dir / "chunks_manifest.csv",
+        out_dir / "embedding_config.json",
+        out_dir / "done.flag",
+    ]:
+        if item.exists():
+            item.unlink()
+
+    chunks_dir = out_dir / "chunks"
+    if chunks_dir.exists():
+        shutil.rmtree(chunks_dir)
+
+
+# ======================================================
+# MAIN PROCESSING
+# ======================================================
+
+def validate_required_columns(df: pd.DataFrame, required_cols: set, csv_path: Path) -> None:
+    """Validate required input columns."""
+
+    missing = required_cols - set(df.columns)
+
+    if missing:
+        raise ValueError(f"Missing columns in {csv_path}: {missing}")
+
+
+def process_ss_csv(
+    ss_csv_path: Path,
+    tokenizer: BertTokenizerFast,
+    model: BertForMaskedLM,
+    device: torch.device,
+    batch_size: int,
+    chunk_size: int,
+) -> None:
+    """Generate SecondaryBERT embeddings for one classification_*_ss.csv file."""
+
+    logging.info("=" * 80)
+    logging.info("Processing: %s", ss_csv_path)
+    logging.info("=" * 80)
 
     df = pd.read_csv(ss_csv_path)
 
-    required = {
+    required_cols = {
         GROUP_COL,
         SEQ_COL,
         SS_COL,
@@ -198,19 +389,18 @@ def process_ss_csv(ss_csv_path: Path, tokenizer, model, device, batch_size: int,
         WINDOW_COL,
     }
 
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing columns in {ss_csv_path}: {missing}")
+    validate_required_columns(df, required_cols, ss_csv_path)
 
     if STATUS_COL in df.columns:
         before = len(df)
         df = df[df[STATUS_COL] == "ok"].copy()
-        print(f"[INFO] Kept ss_status == ok: {len(df):,}/{before:,}", flush=True)
+        logging.info("Kept ss_status == ok: %d/%d", len(df), before)
 
     df = df.copy()
     df["clean_ss"] = df[SS_COL].apply(clean_secondary_structure)
     df = df[df["clean_ss"] != ""].copy()
 
+    # Keep one row per group_id so secondary embeddings are aligned by group.
     df = df.sort_values(GROUP_COL).drop_duplicates(GROUP_COL, keep="first")
     df = df.reset_index(drop=True)
 
@@ -226,27 +416,13 @@ def process_ss_csv(ss_csv_path: Path, tokenizer, model, device, batch_size: int,
     ss_list = df["clean_ss"].tolist()
     total = len(df)
 
-    print(f"[INFO] Rows to embed: {total:,}", flush=True)
-    print(f"[INFO] Batch size: {batch_size}", flush=True)
-    print(f"[INFO] Chunk size: {chunk_size}", flush=True)
-    print(f"[INFO] Output dir: {out_dir}", flush=True)
+    logging.info("Rows to embed: %d", total)
+    logging.info("Batch size: %d", batch_size)
+    logging.info("Chunk size: %d", chunk_size)
+    logging.info("Output dir: %s", out_dir)
 
     save_metadata_and_index(df, group_ids, out_dir)
-
-    config = {
-        "source_csv": str(ss_csv_path),
-        "total_rows": int(total),
-        "batch_size": int(batch_size),
-        "chunk_size": int(chunk_size),
-        "window_size": int(WINDOW_SIZE),
-        "max_len": int(MAX_LEN),
-        "hidden_size": int(HIDDEN_SIZE),
-        "dtype": "float32",
-        "output_shape_per_row": [WINDOW_SIZE, HIDDEN_SIZE],
-    }
-
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
+    write_embedding_config(config_path, ss_csv_path, total, batch_size, chunk_size)
 
     manifest_rows = []
 
@@ -259,10 +435,11 @@ def process_ss_csv(ss_csv_path: Path, tokenizer, model, device, batch_size: int,
         gid_chunk_path = chunks_dir / f"chunk_{chunk_id:06d}_group_ids.npy"
 
         if chunk_is_valid(x_chunk_path, gid_chunk_path, expected_rows):
-            print(
-                f"[SKIP] Chunk {chunk_id:06d} already exists "
-                f"({end:,}/{total:,})",
-                flush=True,
+            logging.info(
+                "Skipping chunk %06d because it already exists (%d/%d)",
+                chunk_id,
+                end,
+                total,
             )
 
             manifest_rows.append({
@@ -305,17 +482,16 @@ def process_ss_csv(ss_csv_path: Path, tokenizer, model, device, batch_size: int,
             global_done = start + local_end
 
             if ((local_start // batch_size) % 20 == 0) or (global_done >= total):
-                print(
-                    f"[INFO] Embedded {global_done:,}/{total:,}",
-                    flush=True,
-                )
+                logging.info("Embedded %d/%d", global_done, total)
 
         x_chunk = np.concatenate(x_parts, axis=0).astype(SAVE_DTYPE, copy=False)
 
-        if x_chunk.shape != (expected_rows, WINDOW_SIZE, HIDDEN_SIZE):
+        expected_shape = (expected_rows, WINDOW_SIZE, HIDDEN_SIZE)
+
+        if x_chunk.shape != expected_shape:
             raise RuntimeError(
                 f"Bad chunk shape for chunk {chunk_id}: "
-                f"{x_chunk.shape}, expected {(expected_rows, WINDOW_SIZE, HIDDEN_SIZE)}"
+                f"{x_chunk.shape}, expected {expected_shape}"
             )
 
         np.save(tmp_x_path, x_chunk)
@@ -324,10 +500,7 @@ def process_ss_csv(ss_csv_path: Path, tokenizer, model, device, batch_size: int,
         tmp_x_path.rename(x_chunk_path)
         tmp_gid_path.rename(gid_chunk_path)
 
-        print(
-            f"[OK] Saved chunk {chunk_id:06d}: rows {start:,}-{end:,}",
-            flush=True,
-        )
+        logging.info("Saved chunk %06d: rows %d-%d", chunk_id, start, end)
 
         manifest_rows.append({
             "chunk_id": chunk_id,
@@ -348,60 +521,80 @@ def process_ss_csv(ss_csv_path: Path, tokenizer, model, device, batch_size: int,
 
     pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
 
-    with open(done_flag, "w") as f:
+    with done_flag.open("w", encoding="utf-8") as f:
         f.write("done\n")
 
-    print(f"[OK] Saved manifest: {manifest_path}", flush=True)
-    print(f"[OK] Finished: {out_dir}", flush=True)
+    logging.info("Saved manifest: %s", manifest_path)
+    logging.info("Finished: %s", out_dir)
 
 
-def find_ss_files(species=None):
+# ======================================================
+# FILE DISCOVERY
+# ======================================================
+
+def find_ss_files(species: Optional[str] = None) -> List[Path]:
+    """Find classification files with secondary structure annotations."""
+
     pattern = "**/classification_*_ss.csv"
     files = sorted(DATA_INTERMEDIATE.glob(pattern))
 
     if species is not None:
-        files = [f for f in files if f"/{species}/" in str(f)]
+        files = [file for file in files if f"/{species}/" in str(file)]
 
     return files
 
 
-def main():
-    parser = argparse.ArgumentParser()
+# ======================================================
+# CLI
+# ======================================================
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+
+    parser = argparse.ArgumentParser(
+        description="Generate SecondaryBERT embeddings from classification_*_ss.csv files."
+    )
 
     parser.add_argument(
         "--csv",
         default=None,
-        help="Specific classification_*_ss.csv file to process",
+        help="Specific classification_*_ss.csv file to process.",
     )
 
     parser.add_argument(
         "--species",
         choices=["human", "mouse"],
         default=None,
-        help="Process only one species if --csv is not provided",
+        help="Process only one species if --csv is not provided.",
     )
 
     parser.add_argument(
         "--batch-size",
         type=int,
         default=BATCH_SIZE,
-        help="Embedding batch size",
+        help="Embedding batch size.",
     )
 
     parser.add_argument(
         "--chunk-size",
         type=int,
         default=CHUNK_SIZE,
-        help="Rows saved per chunk",
+        help="Rows saved per chunk.",
     )
 
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Delete existing chunk outputs and recompute",
+        help="Delete existing outputs and recompute.",
     )
 
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> None:
+    setup_logging()
+
+    args = parse_args()
 
     DATA_INPUT_NN.mkdir(parents=True, exist_ok=True)
 
@@ -412,32 +605,16 @@ def main():
     else:
         files = find_ss_files(species=args.species)
 
-    print(f"[INFO] Files to process: {len(files)}", flush=True)
+    logging.info("Files to process: %d", len(files))
 
-    for f in files:
-        out_dir = build_output_dir(f)
+    for file_path in files:
+        out_dir = build_output_dir(file_path)
 
         if args.force and out_dir.exists():
-            print(f"[INFO] Force enabled. Removing previous outputs in: {out_dir}", flush=True)
-
-            for item in [
-                out_dir / "group_ids.npy",
-                out_dir / "metadata.csv",
-                out_dir / "group_index.csv",
-                out_dir / "chunks_manifest.csv",
-                out_dir / "embedding_config.json",
-                out_dir / "done.flag",
-            ]:
-                if item.exists():
-                    item.unlink()
-
-            chunks_dir = out_dir / "chunks"
-            if chunks_dir.exists:
-                for item in chunks_dir.glob("chunk_*"):
-                    item.unlink()
+            remove_previous_outputs(out_dir)
 
         process_ss_csv(
-            ss_csv_path=f,
+            ss_csv_path=file_path,
             tokenizer=tokenizer,
             model=model,
             device=device,
@@ -445,7 +622,7 @@ def main():
             chunk_size=args.chunk_size,
         )
 
-    print("\n[OK] All SecondaryBERT embeddings finished.", flush=True)
+    logging.info("All SecondaryBERT embeddings finished.")
 
 
 if __name__ == "__main__":
