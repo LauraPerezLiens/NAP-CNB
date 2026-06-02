@@ -17,7 +17,7 @@ external data (IEDB) → data_download → data_classification
 ```
 
 - Input → IEDB API
-- Output → `merged_unique_events.csv`
+- Output → raw IEDB exports + `merged_unique_events.csv`
 
 ---
 
@@ -28,6 +28,8 @@ external data (IEDB) → data_download → data_classification
 Downloads and processes epitope data from IEDB.
 
 #### Data sources
+
+The IEDB API is queried using offset-based pagination to retrieve complete result sets.
 
 - MHC assays → https://query-api.iedb.org/mhc_export
 - T-cell assays → https://query-api.iedb.org/tcell_export
@@ -62,9 +64,9 @@ data_raw/
 
 For each haplotype:
 
-- `mhc_export_full.csv` → raw MHC data from IEDB
-- `tcell_export_full.csv` → raw T-cell data from IEDB
-- `merged_unique_events.csv` → final processed dataset
+- `mhc_export_full.csv` → Raw MHC assay data downloaded from IEDB.
+- `tcell_export_full.csv` → Raw T-cell assay data downloaded from IEDB.
+- `merged_unique_events.csv` → Deduplicated epitope event dataset used by downstream modules.
 
 #### Filtering criteria
 
@@ -88,7 +90,7 @@ The script applies the following filters when querying IEDB:
 6. Filter invalid entries:
    - Missing epitope
    - Missing start/end positions
-7. Remove duplicates
+7. Remove duplicate epitope events based on epitope sequence, coordinates, source protein and parent protein.
 8. Save final dataset (`merged_unique_events.csv`)
 
 #### Canonical epitope extraction
@@ -129,11 +131,20 @@ python3 build_iedb_dataset.py
 
 - Output size depends on IEDB content and filters
 - Some entries are discarded due to missing or invalid data
-- `protein_id` is derived from `parent_id`
+- `protein_id` is currently identical to `parent_id` and is included for downstream compatibility.
 - Dataset quality depends on IEDB consistency
+
+---
+
+## Important
+
+This module does not validate protein sequences or amino acid content.
+
+Sequence validation and removal of proteins containing non-standard amino acids are performed later during FASTA retrieval by the `fetch_parent_proteins_fastas.py` script in the data_classification module.
 
 ---
 
 ## Summary
 
 This module retrieves and processes raw epitope data from IEDB, generating the base dataset used in downstream steps of the pipeline.
+
