@@ -59,6 +59,9 @@ Expected columns:
 protein_url | fasta
 ```
 
+The FASTA file is expected to originate from `fetch_parent_proteins_fastas.py` and therefore already contains only validated protein sequences.
+
+
 #### Output
 
 ```text
@@ -69,10 +72,11 @@ secondary_struct_mouse.csv
 Output columns:
 
 ```text
-id | protein_url | sequence | secondary_structure
+protein_url | sequence | secondary_structure
 ```
 
 #### Key features
+
 - Predicts full-length protein secondary structure
 - Handles long proteins using overlapping windows:
    - window size → 1024 aa
@@ -81,8 +85,24 @@ id | protein_url | sequence | secondary_structure
 - Skips proteins with invalid amino acids
 - Validates sequence and output lengths
 
+For proteins longer than 1024 residues:
+
+- Predictions are generated independently for overlapping windows
+- Window probabilities are averaged in overlapping regions
+- The final secondary structure is reconstructed residue-by-residue
+
+#### Protein validation
+
+Only proteins containing standard amino acids are used:
+
+```text
+ACDEFGHIKLMNPQRSTVWY
+```
+
+Proteins containing any other residue are skipped before prediction.
 
 #### Model details
+
 - Architecture → ProteinUnet
 - Output labels → C / H / E
 - Prediction granularity → residue-level
@@ -123,6 +143,16 @@ classification_*.csv
 classification_*_blosum.csv
 ```
 
+#### Required classification columns
+
+```text
+protein_group_id
+group_id
+25aa_seq
+protein_url
+window_start
+```
+
 #### Output
 
 ```text
@@ -136,7 +166,7 @@ classification_*_blosum_ss.csv
 3. Validate window coordinates
 4. Validate exact sequence match
 5. Extract secondary structure windows
-6. Propagate annotations to BLOSUM variants
+6. Propagate annotations to BLOSUM variants using `protein_group_id` and `group_id`
 
 #### Added columns
 
@@ -146,6 +176,17 @@ protein_found
 sequence_match
 ss_status
 ```
+
+#### Dataset identifiers
+
+The module preserves:
+
+```text
+protein_group_id
+group_id
+```
+
+and uses them to propagate secondary structure annotations from the original classification windows to all BLOSUM variants.
 
 #### Secondary structure status
 
@@ -168,8 +209,9 @@ Secondary structure windows have fixed length:
 25 residues
 ```
 
-- BLOSUM variants inherit secondary structure from the original sequence using `group_id`
+- BLOSUM variants inherit secondary structure from the original sequence using both `protein_group_id` and `group_id`.
 - Exact sequence validation ensures mapping consistency
+- Secondary structure is assigned only when the classification window exactly matches the parent protein sequence
 
 #### Execution
 
@@ -178,8 +220,21 @@ Run:
 ```bash
 python3 add_secondary_structure.py
 ```
+
+---
+
+## Important
+
+Because proteins containing non-standard amino acids are removed during `data_classification`, secondary structure prediction is performed only on validated protein sequences.
+
+As a consequence:
+
+- All predicted structures correspond to valid protein sequences
+- Secondary structure mapping is deterministic
+- `protein_group_id` and `group_id` remain consistent across classification, BLOSUM and secondary-structure datasets
+
 ---
 
 ## Summary
 
-This module predicts protein secondary structure and integrates it into the classification datasets, enabling downstream structural embedding generation and machine learning analysis.
+This module predicts secondary structure for validated parent proteins and integrates residue-level structural annotations into classification and BLOSUM datasets while preserving dataset identifiers required by downstream embedding workflows.
