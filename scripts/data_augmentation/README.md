@@ -17,7 +17,7 @@ data_classification → data_augmentation → embeddings
 ```
 
 - Input → labeled 25-aa windows
-- Output → augmented sequences with BLOSUM-based mutations
+- Output → augmented sequences with BLOSUM-based mutations and preserved dataset identifiers
 
 ---
 
@@ -31,7 +31,18 @@ Generates sequence variants using the `BLOSUM62` substitution matrix.
 
 `classification_{species}_{class}_{haplotype}.csv`
 
-Each row contains a 25 amino acid sequence and its label.
+Each row contains a 25-aa classification window together with its identifiers and labels.
+
+#### Required input columns
+
+```text
+protein_group_id
+group_id
+25aa_seq
+contains_epitope
+selected_epitope
+epitope_pos_score
+```
 
 #### Output
 
@@ -48,12 +59,17 @@ For each input sequence:
 
 #### Variant generation
 
-Given a sequence of length 25:
-
 ```text
 1 original sequence
-+ 25 mutated variants (1 per position)
-= 26 total sequences per input row
++ N mutated variants (one per position)
+= N + 1 sequences
+```
+
+For the current pipeline:
+
+```text
+N = 25
+→ 26 sequences per input row
 ```
 
 Each mutation:
@@ -66,17 +82,43 @@ Each mutation:
 Each row in the output dataset:
 
 ```text
-original_seq | blosum_seq | group_id | contains_epitope | selected_epitope | epitope_pos_score
+protein_group_id | group_id | original_seq | blosum_seq | contains_epitope | selected_epitope | epitope_pos_score
 ```
+
+#### Data validation
+
+- Empty sequences are skipped
+- Sequences containing non-standard amino acids are skipped
+- Rows with invalid protein_group_id or group_id values are skipped
 
 #### Columns
 
+- `protein_group_id` → identifier linking all variants to the same parent protein
+- `group_id` → identifier linking all variants generated from the same original 25-aa window
 - `original_seq` → original 25-aa sequence
 - `blosum_seq` → mutated (or original) sequence
-- `group_id` → links all variants from the same original sequence
 - `contains_epitope` → label (`0`/`1`)
 - `selected_epitope` → epitope sequence (if any)
 - `epitope_pos_score` → relative epitope position
+
+#### Dataset identifiers
+
+The identifiers generated during `data_classification`
+are preserved:
+
+```text
+protein_group_id
+```
+
+Links every augmented sequence to its parent protein.
+
+```text
+group_id
+```
+
+Links every augmented sequence to the original 25-aa classification window.
+
+All BLOSUM variants generated from the same window share the same identifiers.
 
 #### Important notes
 
@@ -105,6 +147,23 @@ input.csv → input_blosum.csv
 
 ---
 
+## Important
+
+This module preserves both
+`protein_group_id`
+and
+`group_id`
+from the classification dataset.
+
+These identifiers allow downstream modules
+(secondary structure, embeddings and neural-network training)
+to trace every augmented sequence back to:
+
+- its parent protein
+- its original classification window
+
+---
+
 ## Summary
 
-This module expands the dataset by generating biologically meaningful sequence variants, improving model generalization and robustness.
+This module expands the classification dataset by generating BLOSUM62-based conservative amino acid substitutions while preserving protein and window identifiers required by downstream modules.
