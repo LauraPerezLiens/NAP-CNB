@@ -1,26 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import argparse
+import logging
 import os
-from optparse import OptionParser
+import sys
+from pathlib import Path
+from typing import List
 
 import numpy as np
 import pandas as pd
 from tensorflow import keras
 from tensorflow.keras.utils import to_categorical
 
+
+# ======================================================
+# TENSORFLOW SETTINGS
+# ======================================================
+
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["XLA_FLAGS"] = "--xla_gpu_strict_conv_algorithm_picker=false"
 
-MODELS_FOLDER = "/home/nap/lperez_nn/model"
-MODEL_PATH = os.path.join(MODELS_FOLDER, "unet_c_ensemble")
+
+# ======================================================
+# CONFIGURATION
+# ======================================================
+
+MODELS_FOLDER = Path("/home/nap/lperez_nn/model")
+MODEL_PATH = MODELS_FOLDER / "unet_c_ensemble"
 
 SS_LIST = ["C", "H", "E"]
 
 FASTA_RESIDUE_LIST = [
     "A", "D", "N", "R", "C", "E", "Q", "G", "H", "I",
-    "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V"
+    "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V",
 ]
+
 VALID_RESIDUES = set(FASTA_RESIDUE_LIST)
 
 NB_RESIDUES = len(FASTA_RESIDUE_LIST)
@@ -30,57 +45,131 @@ WINDOW_SIZE = 1024
 OVERLAP = 200
 STEP = WINDOW_SIZE - OVERLAP
 
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"No existe el modelo en: {MODEL_PATH}")
 
-ensemble_c_model = keras.models.load_model(MODEL_PATH)
+# ======================================================
+# LOGGING
+# ======================================================
 
+class MaxLevelFilter(logging.Filter):
+    """Filter log records up to a maximum logging level."""
+
+    def __init__(self, max_level: int) -> None:
+        super().__init__()
+        self.max_level = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno <= self.max_level
+
+
+def setup_logging() -> None:
+    """Configure logging: INFO goes to stdout, WARNING/ERROR goes to stderr."""
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
+    stdout_handler.addFilter(MaxLevelFilter(logging.INFO))
+    stdout_handler.setFormatter(formatter)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setFormatter(formatter)
+
+    logger.addHandler(stdout_handler)
+    logger.addHandler(stderr_handler)
+
+
+# ======================================================
+# MODEL
+# ======================================================
+
+def load_protein_unet_model(model_path: Path):
+    """Load the trained ProteinUnet model."""
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
+    logging.info("Loading ProteinUnet model from: %s", model_path)
+
+    return keras.models.load_model(model_path)
+
+
+# ======================================================
+# FASTA / SEQUENCE HELPERS
+# ======================================================
 
 def fasta_to_sequence(fasta_text: str) -> str:
+    """Convert FASTA text into a plain amino acid sequence."""
+
     if pd.isna(fasta_text) or not fasta_text:
         return ""
+
     lines = str(fasta_text).splitlines()
     seq = "".join(line.strip() for line in lines if not line.startswith(">"))
+
     return seq.strip().upper()
 
 
-def get_invalid_residues(seq: str):
-    return sorted(set(r for r in seq if r not in VALID_RESIDUES))
+def get_invalid_residues(seq: str) -> List[str]:
+    """Return non-standard amino acid residues found in the sequence."""
+
+    return sorted(set(residue for residue in seq if residue not in VALID_RESIDUES))
 
 
-def fill_array_with_value(array: np.ndarray, length_limit: int, value):
+def fill_array_with_value(array: np.ndarray, length_limit: int, value: float) -> np.ndarray:
+    """Pad an array up to length_limit using a constant value."""
+
     array_length = len(array)
+
     filler = value * np.ones(
         (length_limit - array_length, array.shape[1]),
-        dtype=array.dtype
+        dtype=array.dtype,
     )
+
     return np.concatenate((array, filler))
 
 
-def predict_window_probabilities(seq: str) -> np.ndarray:
+# ======================================================
+# SECONDARY STRUCTURE PREDICTION
+# ======================================================
+
+def predict_window_probabilities(seq: str, model) -> np.ndarray:
+    """
+    Predict secondary structure probabilities for one sequence window.
+
+    The input sequence must be shorter than or equal to WINDOW_SIZE.
+    """
+
     seq = str(seq).strip().upper()
+
     if not seq:
         return np.empty((0, len(SS_LIST)), dtype=np.float32)
 
     invalid_residues = get_invalid_residues(seq)
     if invalid_residues:
         raise ValueError(
-            f"Secuencia con residuos no estándar: {','.join(invalid_residues)}"
+            f"Sequence contains non-standard residues: {','.join(invalid_residues)}"
         )
 
     if len(seq) > WINDOW_SIZE:
-        raise ValueError(f"La ventana no puede superar {WINDOW_SIZE} aa")
+        raise ValueError(f"Window length cannot exceed {WINDOW_SIZE} aa")
 
     sequence = to_categorical(
-        [RESIDUE_DICT[r] for r in seq],
-        num_classes=NB_RESIDUES
+        [RESIDUE_DICT[residue] for residue in seq],
+        num_classes=NB_RESIDUES,
     )
 
     sequence = fill_array_with_value(sequence, WINDOW_SIZE, 0)
-    pred_c = ensemble_c_model.predict(np.array([sequence]), verbose=0)
+
+    pred_c = model.predict(np.array([sequence]), verbose=0)
 
     if hasattr(pred_c, "numpy"):
         pred_c = pred_c.numpy()
+
     if isinstance(pred_c, list):
         pred_c = pred_c[0]
 
@@ -93,45 +182,59 @@ def predict_window_probabilities(seq: str) -> np.ndarray:
 
 
 def probabilities_to_ss(prob_matrix: np.ndarray) -> str:
+    """Convert probability matrix into C/H/E secondary structure labels."""
+
     if prob_matrix.size == 0:
         return ""
+
     indices = np.argmax(prob_matrix, axis=-1)
+
     return "".join(SS_LIST[int(idx)] for idx in indices)
 
 
-def predict_secondary_structure(seq: str) -> str:
+def predict_secondary_structure(seq: str, model) -> str:
+    """
+    Predict secondary structure for a full protein sequence.
+
+    Short sequences are predicted directly. Long sequences are split into
+    overlapping windows and recombined using averaged probabilities.
+    """
+
     seq = str(seq).strip().upper()
+
     if not seq:
         return ""
 
     invalid_residues = get_invalid_residues(seq)
     if invalid_residues:
         raise ValueError(
-            f"Secuencia con residuos no estándar: {','.join(invalid_residues)}"
+            f"Sequence contains non-standard residues: {','.join(invalid_residues)}"
         )
 
     seq_len = len(seq)
 
     if seq_len <= WINDOW_SIZE:
-        prob_matrix = predict_window_probabilities(seq)
+        prob_matrix = predict_window_probabilities(seq, model)
         return probabilities_to_ss(prob_matrix)
 
     sum_probs = np.zeros((seq_len, len(SS_LIST)), dtype=np.float32)
     counts = np.zeros(seq_len, dtype=np.float32)
 
     starts = list(range(0, seq_len, STEP))
+
     if starts[-1] + WINDOW_SIZE < seq_len:
         starts.append(seq_len - WINDOW_SIZE)
 
-    starts = sorted(set(min(s, seq_len - WINDOW_SIZE) for s in starts))
+    starts = sorted(set(min(start, seq_len - WINDOW_SIZE) for start in starts))
 
     for start in starts:
         end = min(start + WINDOW_SIZE, seq_len)
         window_seq = seq[start:end]
-        window_probs = predict_window_probabilities(window_seq)
 
+        window_probs = predict_window_probabilities(window_seq, model)
         win_len = len(window_seq)
 
+        # Trim overlapping borders except for the first and last windows.
         left_trim = 0 if start == 0 else OVERLAP // 2
         right_trim = 0 if end == seq_len else OVERLAP // 2
 
@@ -145,45 +248,74 @@ def predict_secondary_structure(seq: str) -> str:
         counts[global_start:global_end] += 1.0
 
     uncovered = np.where(counts == 0)[0]
+
     if len(uncovered) > 0:
+        # Fallback: if any residue was not covered after trimming, use full windows.
         for start in starts:
             end = min(start + WINDOW_SIZE, seq_len)
             window_seq = seq[start:end]
-            window_probs = predict_window_probabilities(window_seq)
+            window_probs = predict_window_probabilities(window_seq, model)
+
             sum_probs[start:end] += window_probs
             counts[start:end] += 1.0
 
     avg_probs = sum_probs / counts[:, None]
+
     return probabilities_to_ss(avg_probs)
 
 
-if __name__ == "__main__":
-    parser = OptionParser()
-    parser.add_option("-i", "--input", dest="input", help="Input CSV file", metavar="FILE")
-    parser.add_option("-o", "--output", dest="output", help="Output CSV file", metavar="FILE")
-    options, args = parser.parse_args()
+# ======================================================
+# INPUT / OUTPUT
+# ======================================================
 
-    in_path = options.input
-    out_path = options.output
+def load_input_csv(input_path: Path) -> pd.DataFrame:
+    """Load input CSV and extract protein sequences from FASTA."""
 
-    if in_path is None or out_path is None:
-        raise ValueError("Debes proporcionar input y output.")
-
-    df = pd.read_csv(in_path)
+    df = pd.read_csv(input_path)
 
     required_cols = ["protein_url", "fasta"]
+
     for col in required_cols:
         if col not in df.columns:
-            raise ValueError(f"El input debe contener la columna {col}")
+            raise ValueError(f"Input file must contain column: {col}")
 
     df["protein_url"] = df["protein_url"].astype(str).str.strip()
     df["sequence"] = df["fasta"].apply(fasta_to_sequence)
+
     df = df[(df["protein_url"] != "") & (df["sequence"] != "")].copy()
 
-    results = []
+    return df
+
+
+def save_secondary_structure_csv(results: List[dict], output_path: Path) -> None:
+    """Save secondary structure predictions to CSV."""
+
+    out_df = pd.DataFrame(
+        results,
+        columns=[
+            "protein_url",
+            "sequence",
+            "secondary_structure",
+        ],
+    )
+
+    out_df.to_csv(output_path, index=False)
+
+
+# ======================================================
+# MAIN PROCESS
+# ======================================================
+
+def process_proteins(input_path: Path, output_path: Path, model) -> None:
+    """Predict secondary structure for all proteins in the input CSV."""
+
+    df = load_input_csv(input_path)
 
     total = len(df)
-    print(f"[INFO] Total proteins to process: {total}")
+
+    logging.info("Total proteins to process: %d", total)
+
+    results = []
 
     n_long = 0
     n_skipped_invalid = 0
@@ -194,11 +326,13 @@ if __name__ == "__main__":
         sequence = row.sequence
 
         invalid_residues = get_invalid_residues(sequence)
+
         if invalid_residues:
             n_skipped_invalid += 1
-            print(
-                f"[WARN] Skipping {protein_url} "
-                f"(invalid residues: {','.join(invalid_residues)})"
+            logging.warning(
+                "Skipping %s because of invalid residues: %s",
+                protein_url,
+                ",".join(invalid_residues),
             )
             continue
 
@@ -206,41 +340,88 @@ if __name__ == "__main__":
             n_long += 1
 
         try:
-            secondary_structure = predict_secondary_structure(sequence)
-        except Exception as e:
-            print(f"[WARN] Failed prediction for {protein_url}: {e}")
+            secondary_structure = predict_secondary_structure(sequence, model)
+
+        except Exception as exc:
+            logging.warning("Failed prediction for %s: %s", protein_url, exc)
             continue
 
         if not secondary_structure:
-            print(f"[WARN] Empty SS output for {protein_url}")
+            logging.warning("Empty secondary structure output for %s", protein_url)
             continue
 
         if len(secondary_structure) != len(sequence):
-            print(
-                f"[WARN] Length mismatch for {protein_url}: "
-                f"sequence={len(sequence)} ss={len(secondary_structure)}"
+            logging.warning(
+                "Length mismatch for %s: sequence=%d ss=%d",
+                protein_url,
+                len(sequence),
+                len(secondary_structure),
             )
             continue
 
         n_ok += 1
 
         results.append({
-            "id": n_ok,
             "protein_url": protein_url,
             "sequence": sequence,
-            "secondary_structure": secondary_structure
+            "secondary_structure": secondary_structure,
         })
 
         if i % 100 == 0 or i == total:
-            print(f"[INFO] Processed {i}/{total}")
+            logging.info("Processed %d/%d", i, total)
 
-    out_df = pd.DataFrame(
-        results,
-        columns=["id", "protein_url", "sequence", "secondary_structure"]
+    save_secondary_structure_csv(results, output_path)
+
+    logging.info("Proteins longer than %d: %d", WINDOW_SIZE, n_long)
+    logging.info("Proteins skipped due to invalid residues: %d", n_skipped_invalid)
+    logging.info("Proteins successfully predicted: %d", n_ok)
+    logging.info("Done secondary structure prediction -> %s", output_path)
+
+
+# ======================================================
+# CLI
+# ======================================================
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+
+    parser = argparse.ArgumentParser(
+        description="Predict protein secondary structure using ProteinUnet."
     )
-    out_df.to_csv(out_path, index=False)
 
-    print(f"[INFO] Proteins longer than {WINDOW_SIZE}: {n_long}")
-    print(f"[INFO] Proteins skipped due to invalid residues: {n_skipped_invalid}")
-    print(f"[INFO] Proteins successfully predicted: {n_ok}")
-    print(f"[OK] Done secondary structure prediction -> {out_path}")
+    parser.add_argument(
+        "-i",
+        "--input",
+        required=True,
+        help="Input CSV file with protein_url and fasta columns.",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="Output CSV file.",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    setup_logging()
+
+    args = parse_args()
+
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+
+    model = load_protein_unet_model(MODEL_PATH)
+
+    process_proteins(
+        input_path=input_path,
+        output_path=output_path,
+        model=model,
+    )
+
+
+if __name__ == "__main__":
+    main()

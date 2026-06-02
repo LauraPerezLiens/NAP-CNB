@@ -65,6 +65,15 @@ def setup_logging() -> None:
 # FASTA PROCESSING
 # =========================
 
+def normalize_url(url: str) -> str:
+    """Normalize protein URLs for consistent matching."""
+
+    if pd.isna(url):
+        return ""
+
+    return str(url).strip().replace("https://", "http://")
+
+
 def fasta_to_sequence(fasta_text: str) -> str:
     """Convert FASTA text into a plain amino acid sequence."""
 
@@ -88,12 +97,13 @@ def build_protein_sequence_map(species: str) -> Dict[str, str]:
     df = pd.read_csv(fasta_csv)
 
     required_cols = ["protein_url", "fasta"]
+
     for col in required_cols:
         if col not in df.columns:
             raise ValueError(f"{fasta_csv} must contain column: {col}")
 
+    df["protein_url"] = df["protein_url"].apply(normalize_url)
     df["sequence"] = df["fasta"].apply(fasta_to_sequence)
-    df["protein_url"] = df["protein_url"].astype(str).str.strip()
     df["sequence"] = df["sequence"].astype(str).str.strip()
 
     df = df[(df["protein_url"] != "") & (df["sequence"] != "")].copy()
@@ -124,8 +134,6 @@ def compute_epitope_position_score(
         0.0  -> epitope center is aligned with the window center
         <0.0 -> epitope is shifted towards the left side of the window
         >0.0 -> epitope is shifted towards the right side of the window
-
-    The score is clipped to the range [-1, 1].
     """
 
     window_center = math.ceil(window_size / 2)
@@ -169,6 +177,47 @@ def validate_exact_match(
 # =========================
 # CLASSIFICATION DATASET
 # =========================
+
+def add_dataset_ids(output_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add dataset-level IDs.
+
+    protein_group_id:
+        One ID per unique protein_url within the classification file.
+
+    group_id:
+        One ID per original 25-aa window row.
+        This ID is later used to connect BLOSUM variants and SS windows
+        back to the original classification window.
+    """
+
+    if output_df.empty:
+        output_df.insert(0, "protein_group_id", [])
+        output_df.insert(1, "group_id", [])
+        return output_df
+
+    protein_map = {
+        protein_url: idx
+        for idx, protein_url in enumerate(
+            output_df["protein_url"].drop_duplicates(),
+            start=1,
+        )
+    }
+
+    output_df.insert(
+        0,
+        "protein_group_id",
+        output_df["protein_url"].map(protein_map),
+    )
+
+    output_df.insert(
+        1,
+        "group_id",
+        range(1, len(output_df) + 1),
+    )
+
+    return output_df
+
 
 def classify_one_haplotype(
     species: str,
@@ -214,13 +263,15 @@ def classify_one_haplotype(
 
     after_required_filter = len(epitopes_df)
 
-    epitopes_df["parent_id"] = epitopes_df["parent_id"].astype(str).str.strip()
+    epitopes_df["parent_id"] = epitopes_df["parent_id"].apply(normalize_url)
 
     epitopes_df["epitope__starting_position"] = pd.to_numeric(
-        epitopes_df["epitope__starting_position"], errors="coerce"
+        epitopes_df["epitope__starting_position"],
+        errors="coerce",
     )
     epitopes_df["epitope__ending_position"] = pd.to_numeric(
-        epitopes_df["epitope__ending_position"], errors="coerce"
+        epitopes_df["epitope__ending_position"],
+        errors="coerce",
     )
 
     epitopes_df["epitope__name_canonical"] = (
@@ -231,7 +282,10 @@ def classify_one_haplotype(
     )
 
     epitopes_df = epitopes_df.dropna(
-        subset=["epitope__starting_position", "epitope__ending_position"]
+        subset=[
+            "epitope__starting_position",
+            "epitope__ending_position",
+        ]
     ).copy()
 
     epitopes_df["epitope__starting_position"] = (
@@ -286,7 +340,6 @@ def classify_one_haplotype(
 
         total_epitopes_before_exact_match += len(prot_epitopes)
 
-        # Keep only epitopes that exactly match the protein sequence coordinates.
         prot_epitopes["exact_match"] = prot_epitopes.apply(
             lambda r: validate_exact_match(
                 protein_seq=seq,
@@ -317,7 +370,6 @@ def classify_one_haplotype(
                 total_proteins,
             )
 
-        # Generate all possible sliding windows of fixed length.
         for i in range(len(seq) - window_size + 1):
             window_seq = seq[i:i + window_size]
             window_start = i + 1
@@ -330,7 +382,6 @@ def classify_one_haplotype(
                 ep_end = e.epitope__ending_position
                 ep_name = e.epitope__name_canonical
 
-                # A window is positive if it fully contains the epitope.
                 if window_start <= ep_start and window_end >= ep_end:
                     pos_score = compute_epitope_position_score(
                         window_start=window_start,
@@ -371,11 +422,12 @@ def classify_one_haplotype(
     ]
 
     output_df = pd.DataFrame(rows, columns=output_cols)
+
     before_dedup = len(output_df)
-
     output_df = output_df.drop_duplicates().reset_index(drop=True)
-
     after_dedup = len(output_df)
+
+    output_df = add_dataset_ids(output_df)
 
     out_dir = DATA_INTERMEDIATE / species / class_type / haplotype
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -391,7 +443,11 @@ def classify_one_haplotype(
             out_file,
         )
 
-    output_df.to_csv(out_file, index=False, float_format=OUTPUT_FLOAT_FORMAT)
+    output_df.to_csv(
+        out_file,
+        index=False,
+        float_format=OUTPUT_FLOAT_FORMAT,
+    )
 
     positive_windows = int(output_df["contains_epitope"].sum()) if not output_df.empty else 0
     total_windows = len(output_df)
@@ -420,6 +476,22 @@ def classify_one_haplotype(
     logging.info("[%s %s %s] epitopes after exact-match filter: %d", species, class_type, haplotype, total_epitopes_after_exact_match)
     logging.info("[%s %s %s] discarded by exact-match filter: %d", species, class_type, haplotype, discarded_exact_match)
     logging.info("[%s %s %s] duplicated rows removed: %d", species, class_type, haplotype, duplicated_rows_removed)
+
+    if not output_df.empty:
+        logging.info(
+            "[%s %s %s] unique protein_group_id: %d",
+            species,
+            class_type,
+            haplotype,
+            output_df["protein_group_id"].nunique(),
+        )
+        logging.info(
+            "[%s %s %s] unique group_id: %d",
+            species,
+            class_type,
+            haplotype,
+            output_df["group_id"].nunique(),
+        )
 
 
 # =========================

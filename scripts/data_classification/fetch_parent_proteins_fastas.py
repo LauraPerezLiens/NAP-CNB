@@ -7,16 +7,17 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Set, Tuple
+from typing import Dict, List, Set, Tuple
 
+import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-# =========================
+# ======================================================
 # CONFIGURATION
-# =========================
+# ======================================================
 
 DATA_RAW = Path("/home/nap/lperez_nn/data/data_raw")
 DATA_INTERMEDIATE = Path("/home/nap/lperez_nn/data/data_intermediate")
@@ -27,6 +28,8 @@ SPECIES = ["human", "mouse"]
 REQUEST_TIMEOUT = 60
 SLEEP_BETWEEN_REQUESTS = 0.1
 PROGRESS_EVERY = 200
+
+VALID_AA = set("ACDEFGHIKLMNPQRSTVWY")
 
 UNIPROT_RE = re.compile(
     r"https?://(?:www\.)?uniprot\.org/uniprot/([A-Z0-9]+(?:[-.][A-Z0-9]+)?)/*$",
@@ -39,9 +42,9 @@ NCBI_PROTEIN_RE = re.compile(
 )
 
 
-# =========================
+# ======================================================
 # LOGGING
-# =========================
+# ======================================================
 
 class MaxLevelFilter(logging.Filter):
     """Filter log records up to a maximum logging level."""
@@ -76,12 +79,12 @@ def setup_logging() -> None:
     logger.addHandler(stderr_handler)
 
 
-# =========================
+# ======================================================
 # HTTP SESSION
-# =========================
+# ======================================================
 
 def make_session() -> requests.Session:
-    """Create a requests session with retry strategy."""
+    """Create a requests session with retry logic."""
 
     session = requests.Session()
 
@@ -95,58 +98,114 @@ def make_session() -> requests.Session:
     )
 
     adapter = HTTPAdapter(max_retries=retry)
+
     session.mount("http://", adapter)
     session.mount("https://", adapter)
 
     return session
 
 
-# =========================
+# ======================================================
+# SEQUENCE HELPERS
+# ======================================================
+
+def normalize_url(url: str) -> str:
+    """Normalize protein URLs for consistent matching."""
+
+    if pd.isna(url):
+        return ""
+
+    return str(url).strip().replace("https://", "http://")
+
+
+def fasta_to_sequence(fasta_text: str) -> str:
+    """Convert FASTA text into a plain amino acid sequence."""
+
+    if not fasta_text:
+        return ""
+
+    return "".join(
+        line.strip()
+        for line in str(fasta_text).splitlines()
+        if not line.startswith(">")
+    ).upper()
+
+
+def get_invalid_residues(seq: str) -> str:
+    """Return non-standard amino acid residues found in a sequence."""
+
+    invalid = sorted(set(seq) - VALID_AA)
+
+    return ",".join(invalid)
+
+
+def extract_protein_name(fasta_text: str) -> str:
+    """Extract protein name from FASTA header."""
+
+    if not fasta_text:
+        return ""
+
+    first_line = str(fasta_text).splitlines()[0].strip()
+
+    if not first_line.startswith(">"):
+        return ""
+
+    header = first_line[1:]
+
+    parts = header.split(" ", 1)
+
+    if len(parts) < 2:
+        return ""
+
+    description = parts[1]
+
+    return re.split(r"\sOS=", description)[0].strip()
+
+
+# ======================================================
 # URL PARSING
-# =========================
+# ======================================================
 
 def parse_protein_url(url: str) -> Tuple[str, str, str]:
     """
-    Parse a protein URL and extract database and accession identifiers.
+    Parse protein URL and extract database identifiers.
 
     Returns:
         db:
-            Protein database name: "uniprot", "ncbi_protein", or "unknown".
+            Database name: uniprot, ncbi_protein or unknown.
         id_full:
-            Full accession identifier, including version if present.
+            Full protein accession.
         id_base:
-            Base accession identifier without version suffix.
-
-    Examples:
-        https://www.uniprot.org/uniprot/P47974.3
-        -> ("uniprot", "P47974.3", "P47974")
-
-        http://www.ncbi.nlm.nih.gov/protein/NP_008818.3
-        -> ("ncbi_protein", "NP_008818.3", "NP_008818")
+            Base accession without isoform/version suffix.
     """
 
-    url = str(url).strip()
+    url = normalize_url(url)
+
     if not url:
         return "", "", ""
 
     match = UNIPROT_RE.match(url)
+
     if match:
         id_full = match.group(1).upper().strip()
         id_base = re.split(r"[-.]", id_full)[0]
+
         return "uniprot", id_full, id_base
 
     match = NCBI_PROTEIN_RE.match(url)
+
     if match:
         id_full = match.group(1).strip()
         id_base = id_full.split(".")[0]
+
         return "ncbi_protein", id_full, id_base
 
     return "unknown", "", ""
 
 
-# =========================
+# ======================================================
 # INPUT COLLECTION
-# =========================
+# ======================================================
 
 def collect_unique_parent_urls(species: str) -> Set[str]:
     """Collect unique parent protein URLs from merged_unique_events.csv files."""
@@ -155,7 +214,7 @@ def collect_unique_parent_urls(species: str) -> Set[str]:
     species_dir = DATA_RAW / species
 
     if not species_dir.exists():
-        logging.warning("Species directory does not exist: %s", species_dir)
+        logging.warning("[%s] species directory does not exist: %s", species, species_dir)
         return urls
 
     for class_dir in sorted(species_dir.iterdir()):
@@ -167,110 +226,106 @@ def collect_unique_parent_urls(species: str) -> Set[str]:
                 continue
 
             csv_file = haplo_dir / "merged_unique_events.csv"
+
             if not csv_file.exists():
-                logging.warning("Missing file: %s", csv_file)
+                logging.warning("[%s] missing file: %s", species, csv_file)
                 continue
 
-            logging.info("Reading %s", csv_file)
+            logging.info("[%s] reading %s", species, csv_file)
 
             with csv_file.open("r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
 
                 for row in reader:
-                    parent_url = str(row.get("parent_id") or "").strip()
+                    parent_url = normalize_url(row.get("parent_id") or "")
+
                     if parent_url:
                         urls.add(parent_url)
 
     return urls
 
 
-# =========================
+# ======================================================
 # FASTA FETCHING
-# =========================
+# ======================================================
 
 def fetch_uniprot_fasta(session: requests.Session, protein_id: str) -> str:
-    """Fetch FASTA sequence from UniProt."""
+    """Fetch FASTA from UniProt."""
 
     if not protein_id:
         return ""
 
-    fasta_url = f"https://rest.uniprot.org/uniprotkb/{protein_id}.fasta"
+    url = f"https://rest.uniprot.org/uniprotkb/{protein_id}.fasta"
 
     try:
-        response = session.get(fasta_url, timeout=REQUEST_TIMEOUT)
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
 
         if response.status_code != 200:
-            logging.debug("UniProt request failed for %s with status %s", protein_id, response.status_code)
             return ""
 
         text = response.text.strip()
+
         if not text.startswith(">"):
-            logging.debug("Invalid UniProt FASTA response for %s", protein_id)
             return ""
 
         return text
 
     except requests.RequestException as exc:
-        logging.debug("UniProt request exception for %s: %s", protein_id, exc)
+        logging.debug("UniProt request failed for %s: %s", protein_id, exc)
         return ""
 
 
 def fetch_ncbi_fasta(session: requests.Session, protein_id: str) -> str:
-    """Fetch FASTA sequence from NCBI Protein."""
+    """Fetch FASTA from NCBI Protein."""
 
     if not protein_id:
         return ""
 
-    fasta_url = (
+    url = (
         "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
         f"?db=protein&id={protein_id}&rettype=fasta&retmode=text"
     )
 
     try:
-        response = session.get(fasta_url, timeout=REQUEST_TIMEOUT)
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
 
         if response.status_code != 200:
-            logging.debug("NCBI request failed for %s with status %s", protein_id, response.status_code)
             return ""
 
         text = response.text.strip()
+
         if not text.startswith(">"):
-            logging.debug("Invalid NCBI FASTA response for %s", protein_id)
             return ""
 
         return text
 
     except requests.RequestException as exc:
-        logging.debug("NCBI request exception for %s: %s", protein_id, exc)
+        logging.debug("NCBI request failed for %s: %s", protein_id, exc)
         return ""
 
 
-def fetch_fasta_with_fallback(session: requests.Session, parent_url: str) -> Tuple[str, str, str, str, str]:
+def fetch_fasta_with_fallback(
+    session: requests.Session,
+    parent_url: str,
+) -> Tuple[str, str, str, str, str]:
     """
-    Fetch FASTA sequence using full identifier first and base identifier as fallback.
+    Fetch FASTA using full accession first and base accession as fallback.
 
     Returns:
-        db:
-            Source database.
-        id_full:
-            Full accession identifier.
-        id_base:
-            Base accession identifier.
-        resolved_id:
-            Identifier that successfully retrieved the FASTA sequence.
-        fasta:
-            FASTA sequence text. Empty string if retrieval failed.
+        db, id_full, id_base, resolved_id, fasta
     """
 
     db, id_full, id_base = parse_protein_url(parent_url)
 
     if db == "uniprot":
         fasta = fetch_uniprot_fasta(session, id_full)
+
         if fasta:
             return db, id_full, id_base, id_full, fasta
 
         if id_base and id_base != id_full:
             fasta = fetch_uniprot_fasta(session, id_base)
+
             if fasta:
                 return db, id_full, id_base, id_base, fasta
 
@@ -278,76 +333,177 @@ def fetch_fasta_with_fallback(session: requests.Session, parent_url: str) -> Tup
 
     if db == "ncbi_protein":
         fasta = fetch_ncbi_fasta(session, id_full)
+
         if fasta:
             return db, id_full, id_base, id_full, fasta
 
         if id_base and id_base != id_full:
             fasta = fetch_ncbi_fasta(session, id_base)
+
             if fasta:
                 return db, id_full, id_base, id_base, fasta
 
         return db, id_full, id_base, "", ""
 
     logging.warning("Unknown protein URL format: %s", parent_url)
+
     return db, id_full, id_base, "", ""
 
 
-# =========================
+# ======================================================
 # OUTPUT
-# =========================
+# ======================================================
 
-def save_fasta_csv(species: str, parent_urls: Set[str]) -> None:
-    """Fetch FASTA sequences and save them into a species-specific CSV file."""
+def save_species_outputs(
+    species: str,
+    valid_rows: List[Dict],
+    master_rows: List[Dict],
+) -> None:
+    """Save FASTA CSV and protein master index for one species."""
 
-    out_file = DATA_INTERMEDIATE / f"{species}_parent_protein_fasta.csv"
+    fasta_out = DATA_INTERMEDIATE / f"{species}_parent_protein_fasta.csv"
+    master_out = DATA_INTERMEDIATE / f"{species}_protein_master_index.csv"
+
+    fasta_df = pd.DataFrame(
+        valid_rows,
+        columns=[
+            "protein_group_id",
+            "protein_url",
+            "db",
+            "id_full",
+            "id_base",
+            "resolved_id",
+            "fasta",
+        ],
+    )
+
+    master_df = pd.DataFrame(
+        master_rows,
+        columns=[
+            "protein_group_id",
+            "protein_url",
+            "protein_name",
+            "resolved_id",
+        ],
+    )
+
+    fasta_df.to_csv(fasta_out, index=False)
+    master_df.to_csv(master_out, index=False)
+
+    logging.info("[%s] FASTA CSV saved: %s", species, fasta_out)
+    logging.info("[%s] protein master index saved: %s", species, master_out)
+
+
+def process_species(species: str) -> None:
+    """Fetch and filter parent protein FASTA sequences for one species."""
+
+    parent_urls = collect_unique_parent_urls(species)
+
+    logging.info("[%s] unique parent proteins: %d", species, len(parent_urls))
+
+    if not parent_urls:
+        logging.warning("[%s] no parent protein URLs found. Skipping.", species)
+        return
+
     session = make_session()
 
+    valid_rows: List[Dict] = []
+    master_rows: List[Dict] = []
+
     total = len(parent_urls)
-    found = 0
+
     missing = 0
+    skipped_invalid = 0
+    unknown_url = 0
+    written = 0
 
-    with out_file.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["protein_url", "db", "id_full", "id_base", "resolved_id", "fasta"])
+    invalid_residue_counter: Dict[str, int] = {}
 
-        for i, parent_url in enumerate(sorted(parent_urls), start=1):
-            db, id_full, id_base, resolved_id, fasta = fetch_fasta_with_fallback(session, parent_url)
+    protein_group_id = 1
 
-            writer.writerow([parent_url, db, id_full, id_base, resolved_id, fasta])
+    for i, parent_url in enumerate(sorted(parent_urls), start=1):
+        parent_url = normalize_url(parent_url)
 
-            if fasta:
-                found += 1
-            else:
-                missing += 1
-                logging.warning("%s | FASTA not found | %s", species, parent_url)
+        db, id_full, id_base, resolved_id, fasta = fetch_fasta_with_fallback(
+            session=session,
+            parent_url=parent_url,
+        )
 
-            if i % PROGRESS_EVERY == 0 or i == total:
-                logging.info("[%s] processed proteins %d/%d", species, i, total)
+        if db == "unknown":
+            unknown_url += 1
 
-            time.sleep(SLEEP_BETWEEN_REQUESTS)
+        if not fasta:
+            missing += 1
+            logging.warning("[%s] FASTA not found: %s", species, parent_url)
+            continue
 
-    logging.info("[%s] FASTA saved to: %s", species, out_file)
-    logging.info("[%s] FASTA found: %d", species, found)
-    logging.info("[%s] FASTA missing: %d", species, missing)
+        sequence = fasta_to_sequence(fasta)
+        invalid_residues = get_invalid_residues(sequence)
+
+        if invalid_residues:
+            skipped_invalid += 1
+
+            for residue in invalid_residues.split(","):
+                invalid_residue_counter[residue] = invalid_residue_counter.get(residue, 0) + 1
+
+            logging.warning(
+                "[%s] skipped non-standard residues (%s): %s",
+                species,
+                invalid_residues,
+                parent_url,
+            )
+            continue
+
+        protein_name = extract_protein_name(fasta)
+
+        valid_rows.append({
+            "protein_group_id": protein_group_id,
+            "protein_url": parent_url,
+            "db": db,
+            "id_full": id_full,
+            "id_base": id_base,
+            "resolved_id": resolved_id,
+            "fasta": fasta,
+        })
+
+        master_rows.append({
+            "protein_group_id": protein_group_id,
+            "protein_url": parent_url,
+            "protein_name": protein_name,
+            "resolved_id": resolved_id,
+        })
+
+        written += 1
+        protein_group_id += 1
+
+        if i % PROGRESS_EVERY == 0 or i == total:
+            logging.info("[%s] processed proteins %d/%d", species, i, total)
+
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+    save_species_outputs(
+        species=species,
+        valid_rows=valid_rows,
+        master_rows=master_rows,
+    )
+
+    logging.info("[%s] total parent proteins: %d", species, total)
+    logging.info("[%s] written valid FASTA: %d", species, written)
+    logging.info("[%s] missing FASTA: %d", species, missing)
+    logging.info("[%s] skipped due to non-standard residues: %d", species, skipped_invalid)
+    logging.info("[%s] unknown URL format: %d", species, unknown_url)
+    logging.info("[%s] invalid residue types: %s", species, invalid_residue_counter)
 
 
-# =========================
+# ======================================================
 # MAIN
-# =========================
+# ======================================================
 
 def main() -> None:
     setup_logging()
 
     for species in SPECIES:
-        parent_urls = collect_unique_parent_urls(species)
-
-        logging.info("[%s] unique parent proteins: %d", species, len(parent_urls))
-
-        if not parent_urls:
-            logging.warning("[%s] no parent protein URLs found. Skipping.", species)
-            continue
-
-        save_fasta_csv(species, parent_urls)
+        process_species(species)
 
     logging.info("DONE")
 
