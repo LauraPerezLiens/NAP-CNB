@@ -139,29 +139,6 @@ def get_invalid_residues(seq: str) -> str:
     return ",".join(invalid)
 
 
-def extract_protein_name(fasta_text: str) -> str:
-    """Extract protein name from FASTA header."""
-
-    if not fasta_text:
-        return ""
-
-    first_line = str(fasta_text).splitlines()[0].strip()
-
-    if not first_line.startswith(">"):
-        return ""
-
-    header = first_line[1:]
-
-    parts = header.split(" ", 1)
-
-    if len(parts) < 2:
-        return ""
-
-    description = parts[1]
-
-    return re.split(r"\sOS=", description)[0].strip()
-
-
 # ======================================================
 # URL PARSING
 # ======================================================
@@ -233,7 +210,7 @@ def collect_unique_parent_urls(species: str) -> Set[str]:
 
             logging.info("[%s] reading %s", species, csv_file)
 
-            with csv_file.open("r", encoding="utf-8") as f:
+            with csv_file.open("r", encoding="utf-8", errors="ignore") as f:
                 reader = csv.DictReader(f)
 
                 for row in reader:
@@ -356,18 +333,15 @@ def fetch_fasta_with_fallback(
 
 def save_species_outputs(
     species: str,
-    valid_rows: List[Dict],
-    master_rows: List[Dict],
+    valid_rows: List[Dict[str, str]],
 ) -> None:
-    """Save FASTA CSV and protein master index for one species."""
+    """Save FASTA CSV for one species."""
 
     fasta_out = DATA_INTERMEDIATE / f"{species}_parent_protein_fasta.csv"
-    master_out = DATA_INTERMEDIATE / f"{species}_protein_master_index.csv"
 
     fasta_df = pd.DataFrame(
         valid_rows,
         columns=[
-            "protein_group_id",
             "protein_url",
             "db",
             "id_full",
@@ -377,22 +351,14 @@ def save_species_outputs(
         ],
     )
 
-    master_df = pd.DataFrame(
-        master_rows,
-        columns=[
-            "protein_group_id",
-            "protein_url",
-            "protein_name",
-            "resolved_id",
-        ],
-    )
-
-    fasta_df.to_csv(fasta_out, index=False)
-    master_df.to_csv(master_out, index=False)
+    fasta_df.to_csv(fasta_out, index=False, encoding="utf-8")
 
     logging.info("[%s] FASTA CSV saved: %s", species, fasta_out)
-    logging.info("[%s] protein master index saved: %s", species, master_out)
 
+
+# ======================================================
+# MAIN PROCESS
+# ======================================================
 
 def process_species(species: str) -> None:
     """Fetch and filter parent protein FASTA sequences for one species."""
@@ -407,8 +373,7 @@ def process_species(species: str) -> None:
 
     session = make_session()
 
-    valid_rows: List[Dict] = []
-    master_rows: List[Dict] = []
+    valid_rows: List[Dict[str, str]] = []
 
     total = len(parent_urls)
 
@@ -418,8 +383,6 @@ def process_species(species: str) -> None:
     written = 0
 
     invalid_residue_counter: Dict[str, int] = {}
-
-    protein_group_id = 1
 
     for i, parent_url in enumerate(sorted(parent_urls), start=1):
         parent_url = normalize_url(parent_url)
@@ -444,7 +407,9 @@ def process_species(species: str) -> None:
             skipped_invalid += 1
 
             for residue in invalid_residues.split(","):
-                invalid_residue_counter[residue] = invalid_residue_counter.get(residue, 0) + 1
+                invalid_residue_counter[residue] = (
+                    invalid_residue_counter.get(residue, 0) + 1
+                )
 
             logging.warning(
                 "[%s] skipped non-standard residues (%s): %s",
@@ -454,10 +419,7 @@ def process_species(species: str) -> None:
             )
             continue
 
-        protein_name = extract_protein_name(fasta)
-
         valid_rows.append({
-            "protein_group_id": protein_group_id,
             "protein_url": parent_url,
             "db": db,
             "id_full": id_full,
@@ -466,15 +428,7 @@ def process_species(species: str) -> None:
             "fasta": fasta,
         })
 
-        master_rows.append({
-            "protein_group_id": protein_group_id,
-            "protein_url": parent_url,
-            "protein_name": protein_name,
-            "resolved_id": resolved_id,
-        })
-
         written += 1
-        protein_group_id += 1
 
         if i % PROGRESS_EVERY == 0 or i == total:
             logging.info("[%s] processed proteins %d/%d", species, i, total)
@@ -484,7 +438,6 @@ def process_species(species: str) -> None:
     save_species_outputs(
         species=species,
         valid_rows=valid_rows,
-        master_rows=master_rows,
     )
 
     logging.info("[%s] total parent proteins: %d", species, total)
