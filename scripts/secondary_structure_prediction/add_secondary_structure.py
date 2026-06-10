@@ -178,46 +178,6 @@ def add_ss_to_normal_classification(
     return out
 
 
-def propagate_ss_to_blosum(
-    blosum_df: pd.DataFrame,
-    normal_df: pd.DataFrame,
-) -> pd.DataFrame:
-    required_blosum = {
-        "protein_group_id",
-        "group_id",
-    }
-    validate_columns(blosum_df, required_blosum, "BLOSUM dataframe")
-
-    required_normal = {
-        "protein_group_id",
-        "group_id",
-        "secondary_structure",
-        "protein_found",
-        "sequence_match",
-        "ss_status",
-    }
-    validate_columns(normal_df, required_normal, "normal dataframe with secondary structure")
-
-    mapping = normal_df[
-        [
-            "protein_group_id",
-            "group_id",
-            "secondary_structure",
-            "protein_found",
-            "sequence_match",
-            "ss_status",
-        ]
-    ].drop_duplicates(subset=["protein_group_id", "group_id"])
-
-    out = blosum_df.merge(
-        mapping,
-        on=["protein_group_id", "group_id"],
-        how="left",
-    )
-
-    return out
-
-
 def process_one_haplotype(
     species: str,
     mhc_class: str,
@@ -254,31 +214,7 @@ def process_one_haplotype(
             logging.info("Normal saved: %s", out_normal_csv)
             logging.info("Status: %s", summarize_status(out_normal))
 
-            blosum_csv = normal_csv.with_name(normal_csv.stem + "_blosum.csv")
-
-            if blosum_csv.exists():
-                blosum_df = pd.read_csv(blosum_csv, low_memory=False)
-
-                out_blosum = propagate_ss_to_blosum(
-                    blosum_df=blosum_df,
-                    normal_df=out_normal,
-                )
-
-                out_blosum_csv = blosum_csv.with_name(blosum_csv.stem + "_ss.csv")
-                out_blosum.to_csv(out_blosum_csv, index=False)
-
-                rows_with_ss = out_blosum["secondary_structure"].notna().sum()
-
-                logging.info("BLOSUM saved: %s", out_blosum_csv)
-                logging.info(
-                    "Rows with secondary structure: %d/%d",
-                    rows_with_ss,
-                    len(out_blosum),
-                )
-                logging.info("BLOSUM status: %s", summarize_status(out_blosum))
-
-            else:
-                logging.info("No BLOSUM file found for: %s", normal_csv.name)
+            logging.info("Secondary structure added to classification dataset only.")
 
         except Exception as exc:
             logging.error("Failed processing %s: %s", normal_csv, exc)

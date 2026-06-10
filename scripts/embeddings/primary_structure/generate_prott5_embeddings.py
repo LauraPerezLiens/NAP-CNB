@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import argparse
 import logging
 import re
 import sys
@@ -31,6 +32,7 @@ SEQ_COL = "blosum_seq"
 LABEL_COL = "contains_epitope"
 POS_COL = "epitope_pos_score"
 GROUP_COL = "group_id"
+PROTEIN_GROUP_COL = "protein_group_id"
 
 
 # ======================================================
@@ -98,10 +100,7 @@ def clean_sequence(seq: str) -> str:
 
     seq = str(seq).strip().upper()
 
-    # Replace unexpected characters by X.
     seq = re.sub(r"[^ACDEFGHIKLMNPQRSTVWYBXZUOJ]", "X", seq)
-
-    # Map rare amino acids to X, as commonly done for ProtT5.
     seq = re.sub(r"[UZOB]", "X", seq)
 
     return seq
@@ -164,9 +163,6 @@ def embed_sequences_mean_pool(
 ) -> np.ndarray:
     """
     Generate ProtT5 embeddings and apply mean pooling over valid tokens.
-
-    Each input sequence is embedded with ProtT5, then token-level embeddings are
-    averaged using the attention mask. The final output has one vector per sequence.
     """
 
     all_embeddings = []
@@ -197,8 +193,6 @@ def embed_sequences_mean_pool(
         ).last_hidden_state
 
         mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
-
-        # Mean pooling over non-padding tokens.
         pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
 
         pooled = pooled.float().cpu().numpy()
@@ -220,12 +214,6 @@ def embed_sequences_mean_pool(
 def build_output_dir(csv_path: Path) -> Path:
     """
     Build the output directory preserving the input dataset hierarchy.
-
-    Example:
-        data_intermediate/human/mhc-I/HLA-A/input.csv
-
-    becomes:
-        data_input_nn/human/mhc-I/HLA-A/input_ProtT5_chunks/
     """
 
     relative_parent = csv_path.parent.relative_to(DATA_INTERMEDIATE)
@@ -248,10 +236,11 @@ def save_chunk_files(
     y: np.ndarray,
     pos: np.ndarray,
     group_ids: np.ndarray,
+    protein_group_ids: np.ndarray,
     metadata_df: pd.DataFrame,
     index_df: pd.DataFrame,
 ) -> None:
-    """Save embeddings, labels, metadata and index files for one chunk."""
+    """Save embeddings, labels, identifiers, metadata and index files for one chunk."""
 
     prefix = out_dir / f"chunk_{chunk_id:06d}"
 
@@ -259,6 +248,7 @@ def save_chunk_files(
     np.save(f"{prefix}_y.npy", y)
     np.save(f"{prefix}_pos.npy", pos)
     np.save(f"{prefix}_group_id.npy", group_ids)
+    np.save(f"{prefix}_protein_group_id.npy", protein_group_ids)
 
     metadata_df.to_csv(f"{prefix}_metadata.csv", index=False)
     index_df.to_csv(f"{prefix}_index.csv", index=False)
@@ -299,26 +289,24 @@ def process_csv_in_chunks(
     device: torch.device,
 ) -> None:
     """
-    Process a BLOSUM-augmented classification CSV in chunks.
-
-    For each chunk:
-        1. Clean sequences.
-        2. Factorize unique sequences.
-        3. Embed each unique sequence once.
-        4. Map embeddings back to all rows.
-        5. Save embeddings and metadata.
+    Process one BLOSUM-augmented classification CSV in chunks.
     """
 
     logging.info("=" * 60)
     logging.info("Processing %s", csv_path)
     logging.info("=" * 60)
 
-    required_cols = {SEQ_COL, LABEL_COL, POS_COL, GROUP_COL}
+    required_cols = {
+        SEQ_COL,
+        LABEL_COL,
+        POS_COL,
+        GROUP_COL,
+        PROTEIN_GROUP_COL,
+    }
 
     out_dir = build_output_dir(csv_path)
     master_index_path = out_dir / "master_index.csv"
 
-    # Rebuild master index on each run so it reflects the current processed chunks.
     if master_index_path.exists():
         master_index_path.unlink()
 
@@ -327,7 +315,6 @@ def process_csv_in_chunks(
     for chunk_id, df in enumerate(reader):
         prefix = out_dir / f"chunk_{chunk_id:06d}_X.npy"
 
-        # Skip chunks that were already generated. This allows interrupted jobs to resume.
         if prefix.exists():
             logging.info("Skipping chunk_%06d because output already exists", chunk_id)
             continue
@@ -347,7 +334,6 @@ def process_csv_in_chunks(
             logging.warning("Skipping empty valid chunk %06d", chunk_id)
             continue
 
-        # Factorization avoids embedding repeated sequences multiple times.
         codes, uniques = pd.factorize(
             df_valid["clean_seq"],
             sort=False,
@@ -368,15 +354,23 @@ def process_csv_in_chunks(
         y = df_valid[LABEL_COL].to_numpy(dtype=np.int64)
         pos = df_valid[POS_COL].to_numpy(dtype=SAVE_DTYPE)
         group_ids = df_valid[GROUP_COL].to_numpy(dtype=np.int64)
+        protein_group_ids = df_valid[PROTEIN_GROUP_COL].to_numpy(dtype=np.int64)
 
         metadata_df = df_valid[
-            [GROUP_COL, SEQ_COL, LABEL_COL, POS_COL]
+            [
+                PROTEIN_GROUP_COL,
+                GROUP_COL,
+                SEQ_COL,
+                LABEL_COL,
+                POS_COL,
+            ]
         ].copy()
 
         index_df = pd.DataFrame({
             "chunk_id": chunk_id,
             "row_idx_in_chunk": np.arange(len(df_valid), dtype=np.int64),
             "y": y,
+            "protein_group_id": protein_group_ids,
             "group_id": group_ids,
         })
 
@@ -387,6 +381,7 @@ def process_csv_in_chunks(
             y=y,
             pos=pos,
             group_ids=group_ids,
+            protein_group_ids=protein_group_ids,
             metadata_df=metadata_df,
             index_df=index_df,
         )
@@ -400,20 +395,43 @@ def process_csv_in_chunks(
 # ENTRYPOINT
 # ======================================================
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate ProtT5 embeddings for one BLOSUM dataset."
+    )
+
+    parser.add_argument(
+        "-i",
+        "--input",
+        required=True,
+        help="Input BLOSUM CSV file.",
+    )
+
+    return parser.parse_args()
+
+
 def main() -> None:
     setup_logging()
 
+    args = parse_args()
+
     DATA_INPUT_NN.mkdir(parents=True, exist_ok=True)
+
+    csv_path = Path(args.input).resolve()
+
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Input CSV not found: {csv_path}")
+
+    logging.info("Input CSV: %s", csv_path)
 
     tokenizer, model, device = load_model_and_tokenizer()
 
-    csv_path = Path(
-        "/data/nap/lperez_nn/data/data_intermediate/"
-        "human/mhc-I/HLA-A/"
-        "classification_human_mhc-I_HLA-A_blosum.csv"
+    process_csv_in_chunks(
+        csv_path=csv_path,
+        tokenizer=tokenizer,
+        model=model,
+        device=device,
     )
-
-    process_csv_in_chunks(csv_path, tokenizer, model, device)
 
 
 if __name__ == "__main__":
