@@ -28,6 +28,7 @@ MODEL_DIR = Path("/home/nap/lperez_nn/model/secondary_bert_mlm")
 # INPUT COLUMNS
 # ======================================================
 
+PROTEIN_GROUP_COL = "protein_group_id"
 GROUP_COL = "group_id"
 SEQ_COL = "25aa_seq"
 SS_COL = "secondary_structure"
@@ -235,16 +236,19 @@ def build_output_dir(ss_csv_path: Path) -> Path:
 
 def save_metadata_and_index(
     df: pd.DataFrame,
+    protein_group_ids: np.ndarray,
     group_ids: np.ndarray,
     out_dir: Path,
 ) -> None:
-    """Save metadata, group index and group ID array."""
+    """Save metadata, group index and group ID arrays."""
 
     metadata_path = out_dir / "metadata.csv"
-    group_index_path = out_dir / "group_index.csv"
-    group_ids_path = out_dir / "group_ids.npy"
+    index_path = out_dir / "index.csv"
+    protein_group_ids_path = out_dir / "protein_group_id.npy"
+    group_ids_path = out_dir / "group_id.npy"
 
     metadata_cols = [
+        PROTEIN_GROUP_COL,
         GROUP_COL,
         SEQ_COL,
         SS_COL,
@@ -266,35 +270,42 @@ def save_metadata_and_index(
 
     df[metadata_cols].to_csv(metadata_path, index=False)
 
-    group_index_df = pd.DataFrame({
+    index_df = pd.DataFrame({
+        PROTEIN_GROUP_COL: protein_group_ids,
         GROUP_COL: group_ids,
         "row_idx_in_X_ss": np.arange(len(group_ids), dtype=np.int64),
     })
 
-    group_index_df.to_csv(group_index_path, index=False)
+    index_df.to_csv(index_path, index=False)
+
+    np.save(protein_group_ids_path, protein_group_ids)
     np.save(group_ids_path, group_ids)
 
     logging.info("Saved metadata: %s", metadata_path)
-    logging.info("Saved group index: %s", group_index_path)
+    logging.info("Saved index: %s", index_path)
+    logging.info("Saved all protein group IDs: %s", protein_group_ids_path)
     logging.info("Saved all group IDs: %s", group_ids_path)
 
 
 def chunk_is_valid(
     x_path: Path,
+    protein_gid_path: Path,
     gid_path: Path,
     expected_rows: int,
 ) -> bool:
     """Check whether an existing chunk is complete and has the expected shape."""
 
-    if not x_path.exists() or not gid_path.exists():
+    if not x_path.exists() or not protein_gid_path.exists() or not gid_path.exists():
         return False
 
     try:
         x = np.load(x_path, mmap_mode="r")
+        protein_gids = np.load(protein_gid_path, mmap_mode="r")
         gids = np.load(gid_path, mmap_mode="r")
 
         return (
             x.shape == (expected_rows, WINDOW_SIZE, HIDDEN_SIZE)
+            and protein_gids.shape[0] == expected_rows
             and gids.shape[0] == expected_rows
         )
 
@@ -323,6 +334,7 @@ def write_embedding_config(
         "dtype": "float32",
         "output_shape_per_row": [WINDOW_SIZE, HIDDEN_SIZE],
         "model_dir": str(MODEL_DIR),
+        "id_columns": [PROTEIN_GROUP_COL, GROUP_COL],
     }
 
     with config_path.open("w", encoding="utf-8") as f:
@@ -335,8 +347,11 @@ def remove_previous_outputs(out_dir: Path) -> None:
     logging.info("Force enabled. Removing previous outputs in: %s", out_dir)
 
     for item in [
+        out_dir / "protein_group_id.npy",
+        out_dir / "group_id.npy",
         out_dir / "group_ids.npy",
         out_dir / "metadata.csv",
+        out_dir / "index.csv",
         out_dir / "group_index.csv",
         out_dir / "chunks_manifest.csv",
         out_dir / "embedding_config.json",
@@ -380,6 +395,7 @@ def process_ss_csv(
     df = pd.read_csv(ss_csv_path)
 
     required_cols = {
+        PROTEIN_GROUP_COL,
         GROUP_COL,
         SEQ_COL,
         SS_COL,
@@ -412,6 +428,7 @@ def process_ss_csv(
     manifest_path = out_dir / "chunks_manifest.csv"
     config_path = out_dir / "embedding_config.json"
 
+    protein_group_ids = df[PROTEIN_GROUP_COL].to_numpy(dtype=np.int64)
     group_ids = df[GROUP_COL].to_numpy(dtype=np.int64)
     ss_list = df["clean_ss"].tolist()
     total = len(df)
@@ -421,7 +438,7 @@ def process_ss_csv(
     logging.info("Chunk size: %d", chunk_size)
     logging.info("Output dir: %s", out_dir)
 
-    save_metadata_and_index(df, group_ids, out_dir)
+    save_metadata_and_index(df, protein_group_ids, group_ids, out_dir)
     write_embedding_config(config_path, ss_csv_path, total, batch_size, chunk_size)
 
     manifest_rows = []
@@ -432,9 +449,15 @@ def process_ss_csv(
         expected_rows = end - start
 
         x_chunk_path = chunks_dir / f"chunk_{chunk_id:06d}_X_ss.npy"
-        gid_chunk_path = chunks_dir / f"chunk_{chunk_id:06d}_group_ids.npy"
+        protein_gid_chunk_path = chunks_dir / f"chunk_{chunk_id:06d}_protein_group_id.npy"
+        gid_chunk_path = chunks_dir / f"chunk_{chunk_id:06d}_group_id.npy"
 
-        if chunk_is_valid(x_chunk_path, gid_chunk_path, expected_rows):
+        if chunk_is_valid(
+            x_path=x_chunk_path,
+            protein_gid_path=protein_gid_chunk_path,
+            gid_path=gid_chunk_path,
+            expected_rows=expected_rows,
+        ):
             logging.info(
                 "Skipping chunk %06d because it already exists (%d/%d)",
                 chunk_id,
@@ -448,19 +471,24 @@ def process_ss_csv(
                 "end": end,
                 "n_rows": expected_rows,
                 "x_file": str(x_chunk_path),
-                "group_ids_file": str(gid_chunk_path),
+                "protein_group_id_file": str(protein_gid_chunk_path),
+                "group_id_file": str(gid_chunk_path),
             })
             continue
 
         tmp_x_path = x_chunk_path.with_suffix(".tmp.npy")
+        tmp_protein_gid_path = protein_gid_chunk_path.with_suffix(".tmp.npy")
         tmp_gid_path = gid_chunk_path.with_suffix(".tmp.npy")
 
         if tmp_x_path.exists():
             tmp_x_path.unlink()
+        if tmp_protein_gid_path.exists():
+            tmp_protein_gid_path.unlink()
         if tmp_gid_path.exists():
             tmp_gid_path.unlink()
 
         ss_chunk = ss_list[start:end]
+        protein_gid_chunk = protein_group_ids[start:end]
         gid_chunk = group_ids[start:end]
 
         x_parts = []
@@ -495,9 +523,11 @@ def process_ss_csv(
             )
 
         np.save(tmp_x_path, x_chunk)
+        np.save(tmp_protein_gid_path, protein_gid_chunk)
         np.save(tmp_gid_path, gid_chunk)
 
         tmp_x_path.rename(x_chunk_path)
+        tmp_protein_gid_path.rename(protein_gid_chunk_path)
         tmp_gid_path.rename(gid_chunk_path)
 
         logging.info("Saved chunk %06d: rows %d-%d", chunk_id, start, end)
@@ -508,7 +538,8 @@ def process_ss_csv(
             "end": end,
             "n_rows": expected_rows,
             "x_file": str(x_chunk_path),
-            "group_ids_file": str(gid_chunk_path),
+            "protein_group_id_file": str(protein_gid_chunk_path),
+            "group_id_file": str(gid_chunk_path),
         })
 
         del x_parts

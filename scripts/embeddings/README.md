@@ -6,23 +6,38 @@ This module generates **feature representations of protein sequences** for downs
 
 Two complementary embedding strategies are implemented:
 
-- **Primary structure embeddings** → based on amino acid sequence (ProtT5)
-- **Secondary structure embeddings** → based on predicted structural states (SecondaryBERT)
+- **Primary structure embeddings** → amino acid sequence embeddings generated with ProtT5
+- **Secondary structure embeddings** → secondary structure embeddings generated with SecondaryBERT
 
-These embeddings capture different biological properties of proteins.
+Both embedding types preserve the relationship between proteins, windows and labels through `protein_group_id` and `group_id`, allowing complete traceability throughout the pipeline.
 
 ---
 
 ## Pipeline role
 
-This module connects:
-
 ```text
-data_augmentation → embeddings → model_training
+data_augmentation
+        │
+        ▼
+embeddings
+        │
+        ▼
+model_training
 ```
 
-- Input → augmented sequences (`*_blosum.csv`)
-- Output → numerical embeddings (model input features)
+**Input**
+
+```text
+classification_*_blosum.csv
+classification_*_ss.csv
+```
+
+**Output**
+
+```text
+ProtT5 embeddings
+SecondaryBERT embeddings
+```
 
 ---
 
@@ -35,131 +50,430 @@ embeddings/
 └── secondary_structure/
     └── generate_secondary_bert_embeddings.py
 ```
+
 ---
 
-## Primary structure embeddings
+# Primary structure embeddings
 
-### Script
+## Script
 
-#### `generate_prott5_embeddings.py`
+### `generate_prott5_embeddings.py`
 
-##### Description
+### Description
 
-Generates embeddings from amino acid sequences using the ProtT5 model.
+Generates sequence-level embeddings from amino acid windows using the ProtT5 protein language model.
 
-##### Input
+The script:
 
-`classification_{species}_{class}_{haplotype}_blosum.csv`
+1. Loads augmented sequence windows from classification datasets.
+2. Cleans protein sequences and converts them to the ProtT5 token format.
+3. Computes ProtT5 token embeddings.
+4. Applies mean pooling across sequence positions.
+5. Saves embeddings, labels and metadata in chunked files.
 
-##### Key steps
+To reduce computation, identical sequences within a chunk are embedded only once and reused through sequence factorization.
 
-1. Clean protein sequences
-2. Convert sequences to ProtT5 format (space-separated amino acids)
-3. Compute embeddings using ProtT5
-4. Apply mean pooling over tokens
-5. Save embeddings in chunks
+---
 
-##### Output
+### Input
 
 ```text
-chunk_XXXXXX_X.npy       → embeddings (float32)
-chunk_XXXXXX_y.npy       → labels
-chunk_XXXXXX_pos.npy     → epitope position score
-chunk_XXXXXX_group_id.npy
-chunk_XXXXXX_metadata.csv
-chunk_XXXXXX_index.csv
+classification_{species}_{class}_{haplotype}_blosum.csv
+```
+
+Required columns:
+
+```text
+protein_group_id
+group_id
+blosum_seq
+contains_epitope
+epitope_pos_score
+```
+
+---
+
+### Embedding details
+
+| Parameter | Value |
+|------------|---------|
+| Model | Rostlab/prot_t5_xl_half_uniref50-enc |
+| Embedding size | 1024 |
+| Pooling | Mean pooling |
+| Maximum length | 30 |
+| Chunk size | 100,000 rows |
+| Batch size | 32 |
+
+Output shape:
+
+```text
+(N, 1024)
+```
+
+One embedding vector per sequence window.
+
+---
+
+### Output
+
+For each chunk:
+
+```text
+chunk_000000_X.npy
+chunk_000000_y.npy
+chunk_000000_pos.npy
+chunk_000000_group_id.npy
+chunk_000000_protein_group_id.npy
+chunk_000000_metadata.csv
+chunk_000000_index.csv
+```
+
+Global index:
+
+```text
 master_index.csv
 ```
 
-##### Embedding details
+---
 
-- Model → `Rostlab/prot_t5_xl_half_uniref50-enc`
-- Output dimension → 1024
-- Pooling → mean pooling
+### Output files
+
+#### Embeddings
+
+```text
+chunk_XXXXXX_X.npy
+```
+
+Shape:
+
+```text
+(N, 1024)
+```
 
 ---
 
-## Secondary structure embeddings
-
-### Script
-
-#### `generate_secondary_bert_embeddings.py`
-
-##### Description
-
-Generates embeddings from predicted secondary structure sequences (C/H/E) using a BERT-based model.
-
-##### Input
-
-`classification_{species}_{class}_{haplotype}_ss.csv`
-
-##### Key steps
-
-1. Clean secondary structure sequences
-2. Ensure fixed length (25 positions)
-3. Convert to BERT format (space-separated tokens)
-4. Compute token-level embeddings
-5. Save embeddings grouped by group_id
-
-##### Output
+#### Labels
 
 ```text
-chunks/
-├── chunk_XXXXXX_X_ss.npy        → embeddings (25 x 768)
-├── chunk_XXXXXX_group_ids.npy
-metadata.csv
-group_index.csv
-chunks_manifest.csv
-embedding_config.json
-done.flag
+chunk_XXXXXX_y.npy
 ```
 
-##### Embedding details
+Binary epitope labels.
 
-- Model → custom SecondaryBERT
-- Input tokens → C / H / E
-- Output shape → (25, 768) per sequence
-- No pooling → preserves positional information
+---
+
+#### Positional score
+
+```text
+chunk_XXXXXX_pos.npy
+```
+
+Epitope position score.
+
+---
+
+#### Group identifiers
+
+```text
+chunk_XXXXXX_group_id.npy
+chunk_XXXXXX_protein_group_id.npy
+```
+
+Used to track windows and proteins across the pipeline.
+
+---
+
+#### Metadata
+
+```text
+chunk_XXXXXX_metadata.csv
+```
+
+Contains:
+
+```text
+protein_group_id
+group_id
+blosum_seq
+contains_epitope
+epitope_pos_score
+```
+
+---
+
+#### Index
+
+```text
+chunk_XXXXXX_index.csv
+```
+
+Maps:
+
+```text
+chunk_id
+row_idx_in_chunk
+protein_group_id
+group_id
+y
+```
+
+---
+
+# Secondary structure embeddings
+
+## Script
+
+### `generate_secondary_bert_embeddings.py`
+
+### Description
+
+Generates contextual embeddings from predicted secondary structure sequences using the pretrained SecondaryBERT model.
+
+The script:
+
+1. Loads secondary structure annotations.
+2. Keeps only windows with valid secondary structure predictions (`ss_status == ok`).
+3. Cleans and normalizes C/H/E sequences.
+4. Converts secondary structure strings into BERT token format.
+5. Computes token-level contextual embeddings.
+6. Saves embeddings, metadata and identifiers grouped by `group_id`.
+
+Unlike ProtT5 embeddings, no pooling is applied because positional information is preserved.
+
+---
+
+### Input
+
+```text
+classification_{species}_{class}_{haplotype}_ss.csv
+```
+
+Required columns:
+
+```text
+protein_group_id
+group_id
+25aa_seq
+secondary_structure
+contains_epitope
+epitope_pos_score
+protein_url
+window_start
+```
+
+Optional columns:
+
+```text
+selected_epitope
+protein_found
+sequence_match
+ss_status
+```
+
+---
+
+### Filtering
+
+If present:
+
+```text
+ss_status == "ok"
+```
+
+Rows without valid secondary structure predictions are excluded before embedding generation.
+
+---
+
+### Embedding details
+
+| Parameter | Value |
+|------------|---------|
+| Model | SecondaryBERT |
+| Hidden size | 768 |
+| Window size | 25 |
+| Maximum length | 30 |
+| Chunk size | 102,400 rows |
+| Batch size | 512 |
+| Pooling | None |
+
+Output shape:
+
+```text
+(N, 25, 768)
+```
+
+Each residue position retains its own embedding vector.
+
+---
+
+### Output structure
+
+```text
+classification_*_SecondaryBERT_by_group/
+│
+├── metadata.csv
+├── index.csv
+├── protein_group_id.npy
+├── group_id.npy
+├── chunks_manifest.csv
+├── embedding_config.json
+├── done.flag
+│
+└── chunks/
+    ├── chunk_000000_X_ss.npy
+    ├── chunk_000000_protein_group_id.npy
+    ├── chunk_000000_group_id.npy
+    ├── chunk_000001_X_ss.npy
+    └── ...
+```
+
+---
+
+### Metadata
+
+```text
+metadata.csv
+```
+
+Contains:
+
+```text
+protein_group_id
+group_id
+25aa_seq
+secondary_structure
+clean_ss
+contains_epitope
+epitope_pos_score
+protein_url
+window_start
+```
+
+plus any optional columns present in the original dataset.
+
+---
+
+### Index
+
+```text
+index.csv
+```
+
+Maps:
+
+```text
+protein_group_id
+group_id
+row_idx_in_X_ss
+```
+
+allowing reconstruction of the relationship between embeddings and original windows.
+
+---
+
+### Chunk manifest
+
+```text
+chunks_manifest.csv
+```
+
+Contains:
+
+```text
+chunk_id
+start
+end
+n_rows
+x_file
+protein_group_id_file
+group_id_file
+```
+
+and allows efficient loading of large embedding collections.
+
+---
+
+### Configuration
+
+```text
+embedding_config.json
+```
+
+Stores:
+
+```text
+source_csv
+chunk_size
+batch_size
+hidden_size
+window_size
+model_dir
+```
+
+for reproducibility.
 
 ---
 
 ## Key differences
 
-
-| Feature               | Primary (ProtT5)        | Secondary (BERT)          |
-|----------------------|-------------------------|----------------------------|
-| Input                | Amino acid sequence     | Secondary structure (C/H/E) |
-| Model                | ProtT5                  | BERT                       |
-| Output shape         | (1024)                  | (25, 768)                  |
-| Pooling              | Mean pooling            | No pooling                 |
-| Information captured | Sequence-level          | Structural pattern         |
+| Feature | Primary (ProtT5) | Secondary (SecondaryBERT) |
+|----------|----------|----------|
+| Input | Amino acid sequence | Secondary structure sequence |
+| Tokens | Amino acids | C / H / E |
+| Model | ProtT5 | SecondaryBERT |
+| Output shape | (1024) | (25, 768) |
+| Pooling | Mean pooling | None |
+| Preserves residue positions | No | Yes |
+| Information captured | Sequence semantics | Structural patterns |
 
 ---
 
 ## Important notes
 
-- Primary and secondary embeddings are **complementary**
-- Primary embeddings capture **biochemical properties**
-- Secondary embeddings capture **structural patterns**
-- Both can be combined as input features in downstream models
+- Primary and secondary embeddings are complementary.
+- Both embedding types preserve `protein_group_id` and `group_id`.
+- SecondaryBERT embeddings are generated only for proteins with valid secondary structure predictions.
+- ProtT5 embeddings are sequence-level representations.
+- SecondaryBERT embeddings retain residue-level positional information.
+- Both embedding sets are used as input features for downstream neural network training.
 
 ---
 
 ## Execution
 
-Primary structure:
+### ProtT5
 
 ```bash
-python3 generate_prott5_embeddings.py
+python3 generate_prott5_embeddings.py \
+    --input classification_human_mhc-I_HLA-A_blosum.csv
 ```
 
-Secondary structure:
+### SecondaryBERT
+
+Process a single file:
 
 ```bash
-python3 generate_secondary_bert_embeddings.py
+python3 generate_secondary_bert_embeddings.py \
+    --csv classification_human_mhc-I_HLA-A_ss.csv
 ```
+
+Process all human datasets:
+
+```bash
+python3 generate_secondary_bert_embeddings.py \
+    --species human
+```
+
+Force regeneration:
+
+```bash
+python3 generate_secondary_bert_embeddings.py \
+    --species human \
+    --force
+```
+
 ---
 
 ## Summary
 
-This module transforms protein data into high-dimensional numerical representations, enabling machine learning models to learn from both sequence and structural information.
+This module transforms protein sequence and secondary structure information into high-dimensional numerical representations suitable for deep learning. ProtT5 provides sequence-level biochemical representations, while SecondaryBERT provides residue-level structural representations. Together they form the feature space used by downstream neural network models.
